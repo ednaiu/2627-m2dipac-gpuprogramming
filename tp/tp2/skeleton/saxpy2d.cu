@@ -171,11 +171,28 @@ __global__ void saxpy_row_per_thread_colmajor(int n, float a, const float *X, fl
 __global__ void saxpy_col_per_thread_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j < n) {
+  for (int i = 0; i < n; i++) {
+    int idx = i * n + j;   // row-major
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
+}
 }
 
 __global__ void saxpy_col_per_thread_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j < n) {
+  for (int i = 0; i < n; i++) {
+    int idx = i + j * n;   // column-major
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
+}
+
 }
 
 // =============================================================================
@@ -195,11 +212,31 @@ __global__ void saxpy_col_per_thread_colmajor(int n, float a, const float *X, fl
 __global__ void saxpy_1d_a_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int blocksPerRow = (n + blockDim.x - 1) / blockDim.x;
+  int b_i = blockIdx.x / blocksPerRow;
+  int b_j = blockIdx.x % blocksPerRow;
+  int i = b_i;
+  int j = b_j * blockDim.x + threadIdx.x;
+  if (j < n) {
+    int idx = i * n + j;   // row-major
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 __global__ void saxpy_1d_a_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int blocksPerRow = (n + blockDim.x - 1) / blockDim.x;
+  int b_i = blockIdx.x / blocksPerRow;
+  int b_j = blockIdx.x % blocksPerRow;
+  int i = b_i;
+  int j = b_j * blockDim.x + threadIdx.x;
+  if (j < n) {
+    int idx = i + j * n;   // column-major
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 // =============================================================================
@@ -218,11 +255,32 @@ __global__ void saxpy_1d_a_colmajor(int n, float a, const float *X, float *Y, Tr
 __global__ void saxpy_1d_b_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int blocksPerCol = (n + blockDim.x - 1) / blockDim.x;
+  int b_j = blockIdx.x / blocksPerCol;
+  int b_i = blockIdx.x % blocksPerCol;
+  int i = b_i * blockDim.x + threadIdx.x;
+  int j = b_j;
+  if (i < n) {
+    int idx = i * n + j;   // row-major
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 __global__ void saxpy_1d_b_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int blocksPerCol = (n + blockDim.x - 1) / blockDim.x;
+int b_j = blockIdx.x / blocksPerCol;
+int b_i = blockIdx.x % blocksPerCol;
+int i = b_i * blockDim.x + threadIdx.x;
+int j = b_j;
+if (i < n) {
+  int idx = i + j * n;   // column-major
+  Y[idx] = a * X[idx] + Y[idx];
+  CHECK_INDEX();
+}
+
 }
 
 // =============================================================================

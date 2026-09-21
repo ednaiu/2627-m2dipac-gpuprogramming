@@ -12,6 +12,9 @@ void saxpyBlocs(const int N, float a, const float *x, float *y)
 {
   int idx;
   // TODO ...
+  idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) { y[idx] = a * x[idx] + y[idx]; }
+  
 }
 
 
@@ -21,6 +24,8 @@ void saxpyBlocsThreads(const int N, float a, const float *x, float *y)
 {
   int idx;
   // TODO ...
+  idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) { y[idx] = a * x[idx] + y[idx]; }
 }
 
 
@@ -30,6 +35,11 @@ void saxpyBlocsThreadsKops(const int N, float a, const float *x, float *y, const
 {
   int idx;
   // TODO ...
+  idx = blockIdx.x * blockDim.x + threadIdx.x;
+  for (int i = 0; i < k; i++) {
+    int index = idx + i * blockDim.x * gridDim.x;
+    if (index < N) { y[index] = a * x[index] + y[index]; }
+  }
 }
 
 // Reference CPU implementation of saxpy
@@ -83,45 +93,55 @@ int main(int argc, char **argv)
 
   // Allocate the vectors dx[N] and dy[N] on the GPU, then copy x and y into dx and dy
   // TODO ...
-
+  cudaMalloc((void **)&dx, N * sizeof(float));
+  cudaMalloc((void **)&dy, N * sizeof(float));
+  cudaMemcpy(dx, x, N * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(dy, y, N * sizeof(float), cudaMemcpyHostToDevice);
   // Launch the kernel saxpyBlocs with an appropriate number of blocks
   // TODO ...
-
+  saxpyBlocs<<<N,1>>>(N, a, dx, dy);
   // Copy dy[N] into res[N] for verification on the CPU
   // TODO ...
-
+  cudaMemcpy(res, dy, N * sizeof(float), cudaMemcpyDeviceToHost);
   // Check the result
   verifySaxpy(a, x, y, res, N);
 
   // Re-initialise dy[N] by copying y[N] into it again
   // TODO ...
-
+  cudaMemcpy(dy, y, N * sizeof(float), cudaMemcpyHostToDevice);
   // Launch the kernel saxpyBlocsThreads with some blockSize and number of blocks
   // TODO ...
   // blockSize = 32, 64, 128, 256, 512, 1024
-
+  int threadsPerBlock = 64;
+  int blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;
+  saxpyBlocsThreads<<<blocksPerGrid, threadsPerBlock>>>(N, a, dx, dy);
   // Copy dy[N] into res[N] for verification on the CPU
   // TODO ...
-
+  cudaMemcpy(res, dy, N * sizeof(float), cudaMemcpyDeviceToHost);
   // Check the result
   verifySaxpy(a, x, y, res, N);
 
   // Re-initialise dy[N] by copying y[N] into it again
   // TODO ...
-
+  cudaMemcpy(dy, y, N * sizeof(float), cudaMemcpyHostToDevice);
   // Launch the kernel saxpyBlocsThreadsKops with some blockSize, number of blocks, and number of operations per thread (variable k)
   // TODO ...
   // blockSize = 32, 64, 128, 256, 512, 1024
   // k = 1, 2, 4, 8, 16, ...
-
+  threadsPerBlock = 64;
+  k = 4;
+  blocksPerGrid = (N + threadsPerBlock * k - 1) / (threadsPerBlock * k);
+  saxpyBlocsThreadsKops<<<blocksPerGrid, threadsPerBlock>>>(N, a, dx, dy, k);
   // Copy dy[N] into res[N] for verification on the CPU
   // TODO ...
-
+  cudaMemcpy(res, dy, N * sizeof(float), cudaMemcpyDeviceToHost);
   // Check the result
   verifySaxpy(a, x, y, res, N);
 
   // Free the GPU arrays
   // TODO ...
+  cudaFree(dy);
+  cudaFree(dx);
 
   // Free the CPU arrays
   free(x);

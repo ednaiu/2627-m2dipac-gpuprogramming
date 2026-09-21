@@ -10,6 +10,7 @@ __global__ void cudaCopyByBlocks(float *tab0, const float *tab1, int size)
   // Compute the correct idx
   // TODO ...
   // idx = ?
+  idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < size) { tab0[idx] = tab1[idx]; }
 }
 
@@ -19,6 +20,7 @@ __global__ void cudaCopyByBlocksThreads(float *tab0, const float *tab1, int size
   // Compute the correct idx in terms of blockIdx.x, threadIdx.x, and blockDim.x
   // TODO ...
   // idx = ?
+  idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < size) { tab0[idx] = tab1[idx]; }
 }
 
@@ -42,13 +44,16 @@ int main(int argc, char **argv) {
   
   // Allocate dynamic arrays dA and dB of size N on the GPU with cudaMalloc
   // TODO ...
-
+  cudaMalloc((void **)&dA, N * sizeof(float));
+  cudaMalloc((void **)&dB, N * sizeof(float));
   // Copy A into dA and B into dB
   // TODO ...
-
+  cudaMemcpy(dA, A, N * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(dB, B, N * sizeof(float), cudaMemcpyHostToDevice);
   // Copy dA into dB using the kernel cudaCopyByBlocks
   // TODO ...
   // cudaCopyByBlocks<<<...,...>>>(...) ???
+  cudaCopyByBlocks<<<N,1>>>(dB, dA, N);
 
   // Wait for kernel cudaCopyByBlocks to finish
   cudaError_t cudaerr = cudaDeviceSynchronize();
@@ -58,7 +63,7 @@ int main(int argc, char **argv) {
 
   // Copy dB into B for verification
   // TODO ...
-
+  cudaMemcpy(B, dB, N * sizeof(float), cudaMemcpyDeviceToHost);
   // Verify the results on the CPU by comparing B with A
   for (i = 0; i < N; i++) { if (A[i] != B[i]) { break; } }
   if (i < N) { cout << "The copy is incorrect!\n"; }
@@ -67,11 +72,13 @@ int main(int argc, char **argv) {
   // Reinitialize B to zero, then copy B into dB again to test the second copy kernel
   for (int i = 0; i < N; i++) { B[i] = 0.0f; }
   // TODO ...
-
+  cudaMemcpy(dB, B, N * sizeof(float), cudaMemcpyHostToDevice);
   // Copy dA into dB with the kernel cudaCopyByBlocksThreads
   // TODO ...
   // cudaCopyByBlocksThreads<<<...,...>>>(...) ???
-
+  int threadsPerBlock = 64;
+  int blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;
+  cudaCopyByBlocksThreads<<<blocksPerGrid, threadsPerBlock>>>(dB, dA, N);
   // Wait for the kernel cudaCopyByBlocksThreads to finish
   cudaerr = cudaDeviceSynchronize();
   if (cudaerr != cudaSuccess) {
@@ -80,7 +87,7 @@ int main(int argc, char **argv) {
 
   // Copy dB into B for verification
   // TODO ...
-
+  cudaMemcpy(B, dB, N * sizeof(float), cudaMemcpyDeviceToHost);
   // Verify the results on the CPU by comparing B with A
   for (i = 0; i < N; i++) { if (A[i] != B[i]) { break; } }
   if (i < N) { cout << "The copy is incorrect!\n"; }
@@ -88,7 +95,8 @@ int main(int argc, char **argv) {
 
   // Deallocate arrays dA[N] and dB[N] on the GPU
   // TODO ...
-
+  cudaFree(dA);
+  cudaFree(dB);
   // Deallocate A and B
   free(A);
   free(B);

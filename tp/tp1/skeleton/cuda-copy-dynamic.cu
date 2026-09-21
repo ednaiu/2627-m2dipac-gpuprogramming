@@ -23,18 +23,18 @@ int main(int argc, char **argv) {
   // Allocate the dynamic float array dA[N] on the GPU using cudaMalloc
   // Allouer le tableau dA dynamique de taille N sur le GPU avec cudaMalloc 
   // TODO / A FAIRE ...
-
+  cudaMalloc((void**)&dA, N * sizeof(float));
   // cudaMemcpy from A[N] to dA[N]
   // cudaMemcpy de A[N] vers dA[N]
   // TODO / A FAIRE ...
-
+  cudaMemcpy(dA, A, N * sizeof(float), cudaMemcpyHostToDevice);
   // cudaMemcpy from dA[N} to B[N]
   // cudaMemcpy de dA[N] vers B[N]
   // TODO / A FAIRE ...
-
-  // Desaollouer le tableau dA[N] sur le GPU
+  cudaMemcpy(B, dA, N * sizeof(float), cudaMemcpyDeviceToHost);
+  // Desaollouer le tableau dA[N] sur le GPU - deletefrom gpu
   // TODO / A FAIRE ...
-
+  cudaFree(dA);
   // Attendre que les kernels GPUs terminent
   cudaError_t cudaerr = cudaDeviceSynchronize();
   if (cudaerr != cudaSuccess) {
