@@ -45,6 +45,16 @@
 //  Build:  nvcc -O2 -arch=native saxpy2d.cu -o saxpy2d
 //  Run:    ./saxpy2d
 // =============================================================================
+//
+//Answers for the questions of the TP:
+/*
+2e) Nothing: only the order of the blocks changes, a warp touches the same elements (3 = 5, 4 = 6).
+3d) 9 = 7 and 10 = 8: only the numbering of the tiles changes.
+4d) 7, 9, 11, 13: row-major no, column-major yes. 8, 10, 12, 14: row-major yes, column-major no.
+    Only the mapping of threadIdx.x counts: coalesced iff threadIdx.x follows the contiguous index.
+5b) The elements of a thread are 32 apart, so at each (di, dj) a warp touches 32 consecutive elements, as in 11-14.
+    Contiguous K x K patch: neighbouring threads K = 4 floats apart -> 128 floats, 16 sectors (2 floats used out of 8): not coalesced.
+*/
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -166,8 +176,8 @@ __global__ void saxpy_row_per_thread_colmajor(int n, float a, const float *X, fl
 //  column, i = 0 .. N-1. N threads, grid ceil(N / BLOCK_SIZE).
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 consecutive floats, 4 sectors -> COALESCED
+//    column-major : 32 floats N apart, 32 sectors -> NOT coalesced
 // =============================================================================
 __global__ void saxpy_col_per_thread_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
@@ -207,19 +217,19 @@ __global__ void saxpy_col_per_thread_colmajor(int n, float a, const float *X, fl
 //    i = b_i,   j = b_j * blockDim.x + threadIdx.x     (guard: j < n)
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 consecutive floats, 4 sectors -> COALESCED
+//    column-major : 32 floats N apart, 32 sectors -> NOT coalesced
 // =============================================================================
 __global__ void saxpy_1d_a_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
-  int blocksPerRow = (n + blockDim.x - 1) / blockDim.x;
-  int b_i = blockIdx.x / blocksPerRow;
-  int b_j = blockIdx.x % blocksPerRow;
-  int i = b_i;
-  int j = b_j * blockDim.x + threadIdx.x;
+  int blocksPerRow = gridDim.x / n;
+  int bi = blockIdx.x / blocksPerRow;
+  int bj = blockIdx.x % blocksPerRow;
+  int i = bi;
+  int j = bj * blockDim.x + threadIdx.x;
   if (j < n) {
-    int idx = i * n + j;   // row-major
+    int idx = i * n + j;
     Y[idx] = a * X[idx] + Y[idx];
     CHECK_INDEX();
   }
@@ -228,13 +238,13 @@ __global__ void saxpy_1d_a_rowmajor(int n, float a, const float *X, float *Y, Tr
 __global__ void saxpy_1d_a_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
-  int blocksPerRow = (n + blockDim.x - 1) / blockDim.x;
-  int b_i = blockIdx.x / blocksPerRow;
-  int b_j = blockIdx.x % blocksPerRow;
-  int i = b_i;
-  int j = b_j * blockDim.x + threadIdx.x;
+  int blocksPerRow = gridDim.x / n;
+  int bi = blockIdx.x / blocksPerRow;
+  int bj = blockIdx.x % blocksPerRow;
+  int i = bi;
+  int j = bj * blockDim.x + threadIdx.x;
   if (j < n) {
-    int idx = i + j * n;   // column-major
+    int idx = i + j * n;
     Y[idx] = a * X[idx] + Y[idx];
     CHECK_INDEX();
   }
@@ -250,19 +260,19 @@ __global__ void saxpy_1d_a_colmajor(int n, float a, const float *X, float *Y, Tr
 //    i = b_i * blockDim.x + threadIdx.x,   j = b_j     (guard: i < n)
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 floats N apart, 32 sectors -> NOT coalesced
+//    column-major : 32 consecutive floats, 4 sectors -> COALESCED
 // =============================================================================
 __global__ void saxpy_1d_b_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
-  int blocksPerCol = (n + blockDim.x - 1) / blockDim.x;
-  int b_j = blockIdx.x / blocksPerCol;
-  int b_i = blockIdx.x % blocksPerCol;
-  int i = b_i * blockDim.x + threadIdx.x;
-  int j = b_j;
+  int blocksPerCol = gridDim.x / n;
+  int bj = blockIdx.x / blocksPerCol;
+  int bi = blockIdx.x % blocksPerCol;
+  int i = bi * blockDim.x + threadIdx.x;
+  int j = bj;
   if (i < n) {
-    int idx = i * n + j;   // row-major
+    int idx = i * n + j;
     Y[idx] = a * X[idx] + Y[idx];
     CHECK_INDEX();
   }
@@ -271,17 +281,16 @@ __global__ void saxpy_1d_b_rowmajor(int n, float a, const float *X, float *Y, Tr
 __global__ void saxpy_1d_b_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
-  int blocksPerCol = (n + blockDim.x - 1) / blockDim.x;
-int b_j = blockIdx.x / blocksPerCol;
-int b_i = blockIdx.x % blocksPerCol;
-int i = b_i * blockDim.x + threadIdx.x;
-int j = b_j;
-if (i < n) {
-  int idx = i + j * n;   // column-major
-  Y[idx] = a * X[idx] + Y[idx];
-  CHECK_INDEX();
-}
-
+  int blocksPerCol = gridDim.x / n;
+  int bj = blockIdx.x / blocksPerCol;
+  int bi = blockIdx.x % blocksPerCol;
+  int i = bi * blockDim.x + threadIdx.x;
+  int j = bj;
+  if (i < n) {
+    int idx = i + j * n;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 // =============================================================================
@@ -291,17 +300,31 @@ if (i < n) {
 //  and b_j -- no division/modulus. Grid: N x ceil(N / BLOCK_SIZE).
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 consecutive floats, 4 sectors -> COALESCED
+//    column-major : 32 floats N apart, 32 sectors -> NOT coalesced
 // =============================================================================
 __global__ void saxpy_2d_a_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int i = blockIdx.x;                               
+  int j = blockIdx.y * blockDim.x + threadIdx.x;    
+  if (j < n) {
+    int idx = i * n + j;   // row-major
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 __global__ void saxpy_2d_a_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int i = blockIdx.x;                               
+  int j = blockIdx.y * blockDim.x + threadIdx.x;    
+  if (j < n) {
+    int idx = j * n + i;   // row-major
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 // =============================================================================
@@ -311,17 +334,30 @@ __global__ void saxpy_2d_a_colmajor(int n, float a, const float *X, float *Y, Tr
 //  b_j = blockIdx.y. Grid: ceil(N / BLOCK_SIZE) x N.
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 floats N apart, 32 sectors -> NOT coalesced
+//    column-major : 32 consecutive floats, 4 sectors -> COALESCED
 // =============================================================================
 __global__ void saxpy_2d_b_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
-  // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y;
+  if (i < n) {
+    int idx = i * n + j;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 __global__ void saxpy_2d_b_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y;
+  if (i < n) {
+    int idx = i + j * n;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 // =============================================================================
@@ -336,17 +372,43 @@ __global__ void saxpy_2d_b_colmajor(int n, float a, const float *X, float *Y, Tr
 //    i = b_i * SIDE + t_i,       j = b_j * SIDE + t_j    (guard on both)
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 floats N apart, 32 sectors -> NOT coalesced
+//    column-major : 32 consecutive floats, 4 sectors -> COALESCED
 // =============================================================================
 __global__ void saxpy_1d_c_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int side = sqrtf(blockDim.x);
+  int tilesPerRow = (n + side - 1) / side;
+  int bi = blockIdx.x / tilesPerRow;
+  int bj = blockIdx.x % tilesPerRow;
+  int ti = threadIdx.x % side;
+  int tj = threadIdx.x / side;
+  int i = bi * side + ti;
+  int j = bj * side + tj;
+  if (i < n && j < n) {
+    int idx = i * n + j;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 __global__ void saxpy_1d_c_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int side = sqrtf(blockDim.x);
+  int tilesPerRow = (n + side - 1) / side;
+  int bi = blockIdx.x / tilesPerRow;
+  int bj = blockIdx.x % tilesPerRow;
+  int ti = threadIdx.x % side;
+  int tj = threadIdx.x / side;
+  int i = bi * side + ti;
+  int j = bj * side + tj;
+  if (i < n && j < n) {
+    int idx = i + j * n;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 // =============================================================================
@@ -357,17 +419,43 @@ __global__ void saxpy_1d_c_colmajor(int n, float a, const float *X, float *Y, Tr
 //    t_i = threadIdx.x / SIDE,   t_j = threadIdx.x % SIDE
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 consecutive floats, 4 sectors -> COALESCED
+//    column-major : 32 floats N apart, 32 sectors -> NOT coalesced
 // =============================================================================
 __global__ void saxpy_1d_d_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int side = sqrtf(blockDim.x);
+  int tilesPerRow = (n + side - 1) / side;
+  int bi = blockIdx.x / tilesPerRow;
+  int bj = blockIdx.x % tilesPerRow;
+  int ti = threadIdx.x / side;
+  int tj = threadIdx.x % side;
+  int i = bi * side + ti;
+  int j = bj * side + tj;
+  if (i < n && j < n) {
+    int idx = i * n + j;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 __global__ void saxpy_1d_d_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int side = sqrtf(blockDim.x);
+  int tilesPerRow = (n + side - 1) / side;
+  int bi = blockIdx.x / tilesPerRow;
+  int bj = blockIdx.x % tilesPerRow;
+  int ti = threadIdx.x / side;
+  int tj = threadIdx.x % side;
+  int i = bi * side + ti;
+  int j = bj * side + tj;
+  if (i < n && j < n) {
+    int idx = i + j * n;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 // =============================================================================
@@ -379,17 +467,43 @@ __global__ void saxpy_1d_d_colmajor(int n, float a, const float *X, float *Y, Tr
 //  Threads column aligned as in kernel 7.
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 floats N apart, 32 sectors -> NOT coalesced
+//    column-major : 32 consecutive floats, 4 sectors -> COALESCED
 // =============================================================================
 __global__ void saxpy_1d_c_alt_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int side = sqrtf(blockDim.x);
+  int tilesPerCol = (n + side - 1) / side;
+  int bj = blockIdx.x / tilesPerCol;
+  int bi = blockIdx.x % tilesPerCol;
+  int ti = threadIdx.x % side;
+  int tj = threadIdx.x / side;
+  int i = bi * side + ti;
+  int j = bj * side + tj;
+  if (i < n && j < n) {
+    int idx = i * n + j;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 __global__ void saxpy_1d_c_alt_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int side = sqrtf(blockDim.x);
+  int tilesPerCol = (n + side - 1) / side;
+  int bj = blockIdx.x / tilesPerCol;
+  int bi = blockIdx.x % tilesPerCol;
+  int ti = threadIdx.x % side;
+  int tj = threadIdx.x / side;
+  int i = bi * side + ti;
+  int j = bj * side + tj;
+  if (i < n && j < n) {
+    int idx = i + j * n;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 // =============================================================================
@@ -399,17 +513,43 @@ __global__ void saxpy_1d_c_alt_colmajor(int n, float a, const float *X, float *Y
 //  kernel 8.
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 consecutive floats, 4 sectors -> COALESCED
+//    column-major : 32 floats N apart, 32 sectors -> NOT coalesced
 // =============================================================================
 __global__ void saxpy_1d_d_alt_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int side = sqrtf(blockDim.x);
+  int tilesPerCol = (n + side - 1) / side;
+  int bj = blockIdx.x / tilesPerCol;
+  int bi = blockIdx.x % tilesPerCol;
+  int ti = threadIdx.x / side;
+  int tj = threadIdx.x % side;
+  int i = bi * side + ti;
+  int j = bj * side + tj;
+  if (i < n && j < n) {
+    int idx = i * n + j;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 __global__ void saxpy_1d_d_alt_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int side = sqrtf(blockDim.x);
+  int tilesPerCol = (n + side - 1) / side;
+  int bj = blockIdx.x / tilesPerCol;
+  int bi = blockIdx.x % tilesPerCol;
+  int ti = threadIdx.x / side;
+  int tj = threadIdx.x % side;
+  int i = bi * side + ti;
+  int j = bj * side + tj;
+  if (i < n && j < n) {
+    int idx = i + j * n;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 // =============================================================================
@@ -422,17 +562,39 @@ __global__ void saxpy_1d_d_alt_colmajor(int n, float a, const float *X, float *Y
 //  (each coordinate is multiplied by the extent of the index it contains).
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 floats N apart, 32 sectors -> NOT coalesced
+//    column-major : 32 consecutive floats, 4 sectors -> COALESCED
 // =============================================================================
 __global__ void saxpy_2d_c_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.x;
+  int bj = blockIdx.y;
+  int ti = threadIdx.x;
+  int tj = threadIdx.y;
+  int i = bi * blockDim.x + ti;
+  int j = bj * blockDim.y + tj;
+  if (i < n && j < n) {
+    int idx = i * n + j;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 __global__ void saxpy_2d_c_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.x;
+  int bj = blockIdx.y;
+  int ti = threadIdx.x;
+  int tj = threadIdx.y;
+  int i = bi * blockDim.x + ti;
+  int j = bj * blockDim.y + tj;
+  if (i < n && j < n) {
+    int idx = i + j * n;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 // =============================================================================
@@ -443,17 +605,39 @@ __global__ void saxpy_2d_c_colmajor(int n, float a, const float *X, float *Y, Tr
 //    i = b_i * blockDim.y + t_i,   j = b_j * blockDim.x + t_j
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 consecutive floats, 4 sectors -> COALESCED
+//    column-major : 32 floats N apart, 32 sectors -> NOT coalesced
 // =============================================================================
 __global__ void saxpy_2d_d_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.x;
+  int bj = blockIdx.y;
+  int ti = threadIdx.y;
+  int tj = threadIdx.x;
+  int i = bi * blockDim.y + ti;
+  int j = bj * blockDim.x + tj;
+  if (i < n && j < n) {
+    int idx = i * n + j;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 __global__ void saxpy_2d_d_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.x;
+  int bj = blockIdx.y;
+  int ti = threadIdx.y;
+  int tj = threadIdx.x;
+  int i = bi * blockDim.y + ti;
+  int j = bj * blockDim.x + tj;
+  if (i < n && j < n) {
+    int idx = i + j * n;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 // =============================================================================
@@ -463,17 +647,39 @@ __global__ void saxpy_2d_d_colmajor(int n, float a, const float *X, float *Y, Tr
 //  in kernel 11.
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 floats N apart, 32 sectors -> NOT coalesced
+//    column-major : 32 consecutive floats, 4 sectors -> COALESCED
 // =============================================================================
 __global__ void saxpy_2d_c_alt_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.y;
+  int bj = blockIdx.x;
+  int ti = threadIdx.x;
+  int tj = threadIdx.y;
+  int i = bi * blockDim.x + ti;
+  int j = bj * blockDim.y + tj;
+  if (i < n && j < n) {
+    int idx = i * n + j;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 __global__ void saxpy_2d_c_alt_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.y;
+  int bj = blockIdx.x;
+  int ti = threadIdx.x;
+  int tj = threadIdx.y;
+  int i = bi * blockDim.x + ti;
+  int j = bj * blockDim.y + tj;
+  if (i < n && j < n) {
+    int idx = i + j * n;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 // =============================================================================
@@ -482,17 +688,39 @@ __global__ void saxpy_2d_c_alt_colmajor(int n, float a, const float *X, float *Y
 //  b_i = blockIdx.y, b_j = blockIdx.x; threads as in kernel 12.
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 consecutive floats, 4 sectors -> COALESCED
+//    column-major : 32 floats N apart, 32 sectors -> NOT coalesced
 // =============================================================================
 __global__ void saxpy_2d_d_alt_rowmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.y;
+  int bj = blockIdx.x;
+  int ti = threadIdx.y;
+  int tj = threadIdx.x;
+  int i = bi * blockDim.y + ti;
+  int j = bj * blockDim.x + tj;
+  if (i < n && j < n) {
+    int idx = i * n + j;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 __global__ void saxpy_2d_d_alt_colmajor(int n, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.y;
+  int bj = blockIdx.x;
+  int ti = threadIdx.y;
+  int tj = threadIdx.x;
+  int i = bi * blockDim.y + ti;
+  int j = bj * blockDim.x + tj;
+  if (i < n && j < n) {
+    int idx = i + j * n;
+    Y[idx] = a * X[idx] + Y[idx];
+    CHECK_INDEX();
+  }
 }
 
 // =============================================================================
@@ -508,17 +736,47 @@ __global__ void saxpy_2d_d_alt_colmajor(int n, float a, const float *X, float *Y
 //  warp would touch then.)
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 floats N apart, 32 sectors -> NOT coalesced
+//    column-major : 32 consecutive floats, 4 sectors -> COALESCED
 // =============================================================================
 __global__ void saxpy_2d_c_kxk_rowmajor(int n, int K, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.x;
+  int bj = blockIdx.y;
+  int ti = threadIdx.x;
+  int tj = threadIdx.y;
+  for (int di = 0; di < K; di++) {
+    for (int dj = 0; dj < K; dj++) {
+      int i = bi * SIDE * K + ti + SIDE * di;
+      int j = bj * SIDE * K + tj + SIDE * dj;
+      if (i < n && j < n) {
+        int idx = i * n + j;
+        Y[idx] = a * X[idx] + Y[idx];
+        CHECK_INDEX();
+      }
+    }
+  }
 }
 
 __global__ void saxpy_2d_c_kxk_colmajor(int n, int K, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.x;
+  int bj = blockIdx.y;
+  int ti = threadIdx.x;
+  int tj = threadIdx.y;
+  for (int di = 0; di < K; di++) {
+    for (int dj = 0; dj < K; dj++) {
+      int i = bi * SIDE * K + ti + SIDE * di;
+      int j = bj * SIDE * K + tj + SIDE * dj;
+      if (i < n && j < n) {
+        int idx = i + j * n;
+        Y[idx] = a * X[idx] + Y[idx];
+        CHECK_INDEX();
+      }
+    }
+  }
 }
 
 // =============================================================================
@@ -534,17 +792,47 @@ __global__ void saxpy_2d_c_kxk_colmajor(int n, int K, float a, const float *X, f
 //  warp would touch then.)
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 consecutive floats, 4 sectors -> COALESCED
+//    column-major : 32 floats N apart, 32 sectors -> NOT coalesced
 // =============================================================================
 __global__ void saxpy_2d_d_kxk_rowmajor(int n, int K, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.x;
+  int bj = blockIdx.y;
+  int ti = threadIdx.y;
+  int tj = threadIdx.x;
+  for (int di = 0; di < K; di++) {
+    for (int dj = 0; dj < K; dj++) {
+      int i = bi * SIDE * K + ti + SIDE * di;
+      int j = bj * SIDE * K + tj + SIDE * dj;
+      if (i < n && j < n) {
+        int idx = i * n + j;
+        Y[idx] = a * X[idx] + Y[idx];
+        CHECK_INDEX();
+      }
+    }
+  }
 }
 
 __global__ void saxpy_2d_d_kxk_colmajor(int n, int K, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.x;
+  int bj = blockIdx.y;
+  int ti = threadIdx.y;
+  int tj = threadIdx.x;
+  for (int di = 0; di < K; di++) {
+    for (int dj = 0; dj < K; dj++) {
+      int i = bi * SIDE * K + ti + SIDE * di;
+      int j = bj * SIDE * K + tj + SIDE * dj;
+      if (i < n && j < n) {
+        int idx = i + j * n;
+        Y[idx] = a * X[idx] + Y[idx];
+        CHECK_INDEX();
+      }
+    }
+  }
 }
 
 // =============================================================================
@@ -560,17 +848,47 @@ __global__ void saxpy_2d_d_kxk_colmajor(int n, int K, float a, const float *X, f
 //  warp would touch then.)
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 floats N apart, 32 sectors -> NOT coalesced
+//    column-major : 32 consecutive floats, 4 sectors -> COALESCED
 // =============================================================================
 __global__ void saxpy_2d_c_alt_kxk_rowmajor(int n, int K, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.y;
+  int bj = blockIdx.x;
+  int ti = threadIdx.x;
+  int tj = threadIdx.y;
+  for (int di = 0; di < K; di++) {
+    for (int dj = 0; dj < K; dj++) {
+      int i = bi * SIDE * K + ti + SIDE * di;
+      int j = bj * SIDE * K + tj + SIDE * dj;
+      if (i < n && j < n) {
+        int idx = i * n + j;
+        Y[idx] = a * X[idx] + Y[idx];
+        CHECK_INDEX();
+      }
+    }
+  }
 }
 
 __global__ void saxpy_2d_c_alt_kxk_colmajor(int n, int K, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.y;
+  int bj = blockIdx.x;
+  int ti = threadIdx.x;
+  int tj = threadIdx.y;
+  for (int di = 0; di < K; di++) {
+    for (int dj = 0; dj < K; dj++) {
+      int i = bi * SIDE * K + ti + SIDE * di;
+      int j = bj * SIDE * K + tj + SIDE * dj;
+      if (i < n && j < n) {
+        int idx = i + j * n;
+        Y[idx] = a * X[idx] + Y[idx];
+        CHECK_INDEX();
+      }
+    }
+  }
 }
 
 // =============================================================================
@@ -586,17 +904,47 @@ __global__ void saxpy_2d_c_alt_kxk_colmajor(int n, int K, float a, const float *
 //  warp would touch then.)
 //
 //  TODO: at one instruction, the 32 threads of a warp touch ... :
-//    row-major    : ?
-//    column-major : ?
+//    row-major    : 32 consecutive floats, 4 sectors -> COALESCED
+//    column-major : 32 floats N apart, 32 sectors -> NOT coalesced
 // =============================================================================
 __global__ void saxpy_2d_d_alt_kxk_rowmajor(int n, int K, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (row-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.y;
+  int bj = blockIdx.x;
+  int ti = threadIdx.y;
+  int tj = threadIdx.x;
+  for (int di = 0; di < K; di++) {
+    for (int dj = 0; dj < K; dj++) {
+      int i = bi * SIDE * K + ti + SIDE * di;
+      int j = bj * SIDE * K + tj + SIDE * dj;
+      if (i < n && j < n) {
+        int idx = i * n + j;
+        Y[idx] = a * X[idx] + Y[idx];
+        CHECK_INDEX();
+      }
+    }
+  }
 }
 
 __global__ void saxpy_2d_d_alt_kxk_colmajor(int n, int K, float a, const float *X, float *Y, Trace tr)
 {
   // TODO: compute i and j, then idx (column-major), Y[idx] = a * X[idx] + Y[idx], CHECK_INDEX()
+  int bi = blockIdx.y;
+  int bj = blockIdx.x;
+  int ti = threadIdx.y;
+  int tj = threadIdx.x;
+  for (int di = 0; di < K; di++) {
+    for (int dj = 0; dj < K; dj++) {
+      int i = bi * SIDE * K + ti + SIDE * di;
+      int j = bj * SIDE * K + tj + SIDE * dj;
+      if (i < n && j < n) {
+        int idx = i + j * n;
+        Y[idx] = a * X[idx] + Y[idx];
+        CHECK_INDEX();
+      }
+    }
+  }
 }
 
 // =============================================================================
@@ -709,23 +1057,23 @@ struct KernelInfo { const char *name; const char *rowMajor; const char *colMajor
 static const KernelInfo kernels[] = {
   { "0  1D reference (flat)",                    "yes", "yes" },
   { "1  one thread per row",                      "no",  "yes" },
-  { "2  one thread per column",                    "?",   "?"   },
-  { "3  (a) 1D blocks, row aligned, 1D idx",       "?",   "?"   },
-  { "4  (b) 1D blocks, col aligned, 1D idx",       "?",   "?"   },
-  { "5  (a) 1D blocks, row aligned, dim3",         "?",   "?"   },
-  { "6  (b) 1D blocks, col aligned, dim3",         "?",   "?"   },
-  { "7  (c) tiles, col aligned, 1D idx",           "?",   "?"   },
-  { "8  (d) tiles, row aligned, 1D idx",           "?",   "?"   },
-  { "9  (c) alt: tiles col by col, col aligned",   "?",   "?"   },
-  { "10 (d) alt: tiles col by col, row aligned",   "?",   "?"   },
-  { "11 (c) 2D blocks, col aligned, dim3",         "?",   "?"   },
-  { "12 (d) 2D blocks, row aligned, dim3",         "?",   "?"   },
-  { "13 (c) alt: grid transposed, col aligned",    "?",   "?"   },
-  { "14 (d) alt: grid transposed, row aligned",    "?",   "?"   },
-  { "15 (c) 2D blocks, col aligned, KxK/thread",   "?",   "?"   },
-  { "16 (d) 2D blocks, row aligned, KxK/thread",   "?",   "?"   },
-  { "17 (c) alt, KxK/thread",                      "?",   "?"   },
-  { "18 (d) alt, KxK/thread",                      "?",   "?"   },
+  { "2  one thread per column",                    "yes", "no"  },
+  { "3  (a) 1D blocks, row aligned, 1D idx",       "yes", "no"  },
+  { "4  (b) 1D blocks, col aligned, 1D idx",       "no",  "yes" },
+  { "5  (a) 1D blocks, row aligned, dim3",         "yes", "no"  },
+  { "6  (b) 1D blocks, col aligned, dim3",         "no",  "yes" },
+  { "7  (c) tiles, col aligned, 1D idx",           "no",  "yes" },
+  { "8  (d) tiles, row aligned, 1D idx",           "yes", "no"  },
+  { "9  (c) alt: tiles col by col, col aligned",   "no",  "yes" },
+  { "10 (d) alt: tiles col by col, row aligned",   "yes", "no"  },
+  { "11 (c) 2D blocks, col aligned, dim3",         "no",  "yes" },
+  { "12 (d) 2D blocks, row aligned, dim3",         "yes", "no"  },
+  { "13 (c) alt: grid transposed, col aligned",    "no",  "yes" },
+  { "14 (d) alt: grid transposed, row aligned",    "yes", "no"  },
+  { "15 (c) 2D blocks, col aligned, KxK/thread",   "no",  "yes" },
+  { "16 (d) 2D blocks, row aligned, KxK/thread",   "yes", "no"  },
+  { "17 (c) alt, KxK/thread",                      "no",  "yes" },
+  { "18 (d) alt, KxK/thread",                      "yes", "no"  },
 };
 static const int numKernels = sizeof(kernels) / sizeof(kernels[0]);
 
