@@ -99,7 +99,13 @@ inline float bval(int k, int j) { return (float)((3 * k + j) % 5); }
 // =============================================================================
 __global__ void matmul_blocks(int n, const float *A, const float *B, float *C)
 {
-  // TODO
+  int i = blockIdx.x;
+  int j = blockIdx.y;
+  float sum = 0.0f;
+  for (int k = 0; k < n; k++) {
+    sum += A[i * n + k] * B[k + j * n];
+  }
+  C[i * n + j] = sum;
 }
 
 // =============================================================================
@@ -113,10 +119,27 @@ __global__ void matmul_blocks(int n, const float *A, const float *B, float *C)
 //  the reads of A and of B at one step k, the write of C -- say what the 32
 //  threads of a warp touch at that instruction and whether the access is
 //  coalesced.
+//
+//  ANSWER:
+//  A: all threads read A(i, k), giving one broadcast from a single sector.
+//  The access is not coalesced.
+//  B: j changes across the warp and the values are N floats apart. The warp
+//  touches 32 sectors. The access is not coalesced.
+//  C: the warp writes 32 neighboring values in row i and fills 4 sectors.
+//  The write is coalesced.
+//  Kernel 1 has one active thread per block. This kernel works with full warps.
 // =============================================================================
 __global__ void matmul_1d_row(int n, const float *A, const float *B, float *C)
 {
-  // TODO
+  int i = blockIdx.x;
+  int j = blockIdx.y * blockDim.x + threadIdx.x;
+  if (j < n) {
+    float sum = 0.0f;
+    for (int k = 0; k < n; k++) {
+      sum += A[i * n + k] * B[k + j * n];
+    }
+    C[i * n + j] = sum;
+  }
 }
 
 // =============================================================================
@@ -131,10 +154,28 @@ __global__ void matmul_1d_row(int n, const float *A, const float *B, float *C)
 //  threads of a warp touch at that instruction and whether the access is
 //  coalesced.
 //  Compare with kernel 2.
+//
+//  ANSWER:
+//  A: i changes across the warp and the values are N floats apart. The warp
+//  touches 32 sectors and the access is not coalesced.
+//  B: every thread reads B(k, j). The value is fetched once from one sector
+//  and broadcast to the warp. This is not a coalesced access.
+//  C: the warp writes 32 values from one column. They are N floats apart. The
+//  write touches 32 sectors and is not coalesced.
+//  Kernel 2 has the opposite read pattern: A is broadcast and B is strided.
+//  Its write to C is coalesced, unlike this one.
 // =============================================================================
 __global__ void matmul_1d_column(int n, const float *A, const float *B, float *C)
 {
-  // TODO
+  int j = blockIdx.x;
+  int i = blockIdx.y * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float sum = 0.0f;
+    for (int k = 0; k < n; k++) {
+      sum += A[i * n + k] * B[k + j * n];
+    }
+    C[i * n + j] = sum;
+  }
 }
 
 // =============================================================================
@@ -151,10 +192,26 @@ __global__ void matmul_1d_column(int n, const float *A, const float *B, float *C
 //  threads of a warp touch at that instruction and whether the access is
 //  coalesced.
 //  Compare with kernel 2.
+//
+//  ANSWER:
+//  A: A(i, k) is shared by the whole warp. The read is a one-sector broadcast,
+//  not a coalesced access.
+//  B: j changes across the warp and the values are N floats apart. The warp
+//  touches 32 sectors. The access is not coalesced.
+//  C: all 32 writes are next to each other in row i and fill 4 sectors. The
+//  write is coalesced. This is the same pattern as kernel 2.
 // =============================================================================
 __global__ void matmul_2d_horizontal(int n, const float *A, const float *B, float *C)
 {
-  // TODO
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  int i = blockIdx.y * blockDim.y + threadIdx.y;
+  if (i < n && j < n) {
+    float sum = 0.0f;
+    for (int k = 0; k < n; k++) {
+      sum += A[i * n + k] * B[k + j * n];
+    }
+    C[i * n + j] = sum;
+  }
 }
 
 // =============================================================================
@@ -171,10 +228,30 @@ __global__ void matmul_2d_horizontal(int n, const float *A, const float *B, floa
 //  coalesced.
 //  Compare with kernels 3 and 4. Is there a mapping of the thread
 //  indices that coalesces the reads of A and of B at the same time?
+//
+//  ANSWER:
+//  A: i changes across the warp and the values are N floats apart. The read
+//  touches 32 sectors and is not coalesced.
+//  B: all threads request B(k, j). One sector supplies the value to the whole
+//  warp. This is a broadcast, not a coalesced access.
+//  C: the warp writes 32 values from one column. The values are N floats apart.
+//  The write touches 32 sectors and is not coalesced.
+//  The access pattern is the same as in kernel 3. Kernel 4 reverses the reads:
+//  A is broadcast, B is strided, and the write to C is coalesced.
+//  No. If j changes across the warp, the read from B is strided. If i changes,
+//  the read from A is strided. Changing both makes both reads strided.
 // =============================================================================
 __global__ void matmul_2d_vertical(int n, const float *A, const float *B, float *C)
 {
-  // TODO
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  if (i < n && j < n) {
+    float sum = 0.0f;
+    for (int k = 0; k < n; k++) {
+      sum += A[i * n + k] * B[k + j * n];
+    }
+    C[i * n + j] = sum;
+  }
 }
 
 // =============================================================================
@@ -191,6 +268,11 @@ __global__ void matmul_2d_vertical(int n, const float *A, const float *B, float 
 //  distance between consecutive columns). Think about what our three
 //  arrays are when read column-major, and which product gives our C.
 //
+//  ANSWER:
+//  cuBLAS reads dA and dC in the opposite direction because they are stored
+//  row-major. dB already has the layout cuBLAS expects. To get the result in
+//  our layout, dB is passed first and transposed, then dA is used as it is.
+//
 //  With FP32 data of small integers the result is exact, so it can be
 //  compared element by element with our kernels.
 // =============================================================================
@@ -198,6 +280,10 @@ void cublasMatmul(cublasHandle_t handle, int n, const float *dA, const float *dB
 {
   // TODO: one cublasSgemm call (wrapped in CUBLAS_CHECK)
   (void)handle; (void)n; (void)dA; (void)dB; (void)dC;
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                           n, n, n, &alpha, dB, n, dA, n, &beta, dC, n));
 }
 
 // =============================================================================
@@ -281,7 +367,7 @@ void check(const char *name, int n, double ms, const float *A, const float *B, f
 // =============================================================================
 int main(void)
 {
-  const int n = 250;   // the matrix size: change it here and rerun
+  const int n = 1024;   // the matrix size: change it here and rerun
   size_t bytes = (size_t)n * n * sizeof(float);
   float *A = (float *)malloc(bytes), *B = (float *)malloc(bytes), *C = (float *)malloc(bytes);
   initialise(n, A, B);
@@ -310,6 +396,8 @@ int main(void)
   // ---- 2. 1D blocks along a row of C --------------------------------------
   // TODO: grid and block of kernel 2 (as given: 1 block of 1 thread)
   dim3 grid2(1), block2(1);
+  grid2 = dim3(n, (n + BS_1D - 1) / BS_1D);
+  block2 = dim3(BS_1D);
   matmul_1d_row<<<grid2, block2>>>(n, dA, dB, dC);   // warm-up
   CUDA_CHECK_KERNEL();
   t0 = now();
@@ -320,6 +408,8 @@ int main(void)
   // ---- 3. 1D blocks along a column of C -----------------------------------
   // TODO: grid and block of kernel 3 (as given: 1 block of 1 thread)
   dim3 grid3(1), block3(1);
+  grid3 = dim3(n, (n + BS_1D - 1) / BS_1D);
+  block3 = dim3(BS_1D);
   matmul_1d_column<<<grid3, block3>>>(n, dA, dB, dC);   // warm-up
   CUDA_CHECK_KERNEL();
   t0 = now();
@@ -330,6 +420,9 @@ int main(void)
   // ---- 4. 2D blocks, warps horizontal -------------------------------------
   // TODO: grid and block of kernel 4 (as given: 1 block of 1 thread)
   dim3 grid4(1), block4(1);
+  block4 = dim3(BS_2D, BS_2D);
+  grid4 = dim3((n + block4.x - 1) / block4.x,
+               (n + block4.y - 1) / block4.y);
   matmul_2d_horizontal<<<grid4, block4>>>(n, dA, dB, dC);   // warm-up
   CUDA_CHECK_KERNEL();
   t0 = now();
@@ -340,6 +433,9 @@ int main(void)
   // ---- 5. 2D blocks, warps vertical ---------------------------------------
   // TODO: grid and block of kernel 5 (as given: 1 block of 1 thread)
   dim3 grid5(1), block5(1);
+  block5 = dim3(BS_2D, BS_2D);
+  grid5 = dim3((n + block5.x - 1) / block5.x,
+               (n + block5.y - 1) / block5.y);
   matmul_2d_vertical<<<grid5, block5>>>(n, dA, dB, dC);   // warm-up
   CUDA_CHECK_KERNEL();
   t0 = now();

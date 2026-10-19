@@ -96,6 +96,9 @@ __global__ void copy_matrix(int n, const float *A, float *At)
 __global__ void transpose_blocks(int n, const float *A, float *At)
 {
   // TODO
+  int i = blockIdx.x;
+  int j = blockIdx.y;
+  At[j * n + i] = A[i * n + j];
 }
 
 // =============================================================================
@@ -105,10 +108,15 @@ __global__ void transpose_blocks(int n, const float *A, float *At)
 //  j = bx*BSXY + tx, to At(j, i): threadIdx.x runs along a row of A. Grid:
 //  ceil(N / BSXY) x ceil(N / BSXY), guard on i and j.
 //  Which of the two accesses of a warp is coalesced?
+//  The read from A: consecutive threads read consecutive floats.
+//  The write to At is strided, not coalesced.
 // =============================================================================
 __global__ void transpose_horizontal(int n, const float *A, float *At)
 {
   // TODO
+  int i = blockIdx.y * BSXY + threadIdx.y;
+  int j = blockIdx.x * BSXY + threadIdx.x;
+  if (i < n && j < n) { At[j * n + i] = A[i * n + j]; }
 }
 
 // =============================================================================
@@ -118,10 +126,15 @@ __global__ void transpose_horizontal(int n, const float *A, float *At)
 //  j = by*BSXY + ty, to At(j, i): threadIdx.x runs down a column of A.
 //  Grid: ceil(N / BSXY) x ceil(N / BSXY), guard on i and j.
 //  Which of the two accesses of a warp is coalesced now?
+//  The write to At: consecutive threads write consecutive floats.
+//  The read from A is strided, not coalesced.
 // =============================================================================
 __global__ void transpose_vertical(int n, const float *A, float *At)
 {
   // TODO
+  int i = blockIdx.x * BSXY + threadIdx.x;
+  int j = blockIdx.y * BSXY + threadIdx.y;
+  if (i < n && j < n) { At[j * n + i] = A[i * n + j]; }
 }
 
 // =============================================================================
@@ -144,6 +157,15 @@ __global__ void transpose_vertical(int n, const float *A, float *At)
 __global__ void transpose_shmem(int n, const float *A, float *At)
 {
   // TODO
+  __shared__ float tile[BSXY][BSXY + 1];
+  int tx = threadIdx.x, ty = threadIdx.y;
+  int i = blockIdx.y * BSXY + ty;
+  int j = blockIdx.x * BSXY + tx;
+  if (i < n && j < n) { tile[ty][tx] = A[i * n + j]; }
+  __syncthreads();
+  i = blockIdx.x * BSXY + ty;
+  j = blockIdx.y * BSXY + tx;
+  if (i < n && j < n) { At[i * n + j] = tile[tx][ty]; }
 }
 
 // =============================================================================
@@ -162,6 +184,21 @@ __global__ void transpose_shmem(int n, const float *A, float *At)
 __global__ void transpose_inplace(int n, float *A)
 {
   // TODO
+  if (blockIdx.x < blockIdx.y) { return; }
+  __shared__ float tile[BSXY][BSXY + 1];
+  __shared__ float mirror[BSXY][BSXY + 1];
+  int tx = threadIdx.x, ty = threadIdx.y;
+  int i = blockIdx.y * BSXY + ty;
+  int j = blockIdx.x * BSXY + tx;
+  int mi = blockIdx.x * BSXY + ty;
+  int mj = blockIdx.y * BSXY + tx;
+  if (i < n && j < n) { tile[ty][tx] = A[i * n + j]; }
+  if (mi < n && mj < n) { mirror[ty][tx] = A[mi * n + mj]; }
+  __syncthreads();
+  if (i < n && j < n) { A[i * n + j] = mirror[tx][ty]; }
+  if (blockIdx.x != blockIdx.y && mi < n && mj < n) {
+    A[mi * n + mj] = tile[tx][ty];
+  }
 }
 
 // =============================================================================
@@ -246,7 +283,7 @@ int main(void)
 
   // ---- 1. N x N blocks of one thread --------------------------------------
   // TODO: grid and block of kernel 1 (as given: 1 block of 1 thread)
-  dim3 grid1(1), block1(1);
+  dim3 grid1(n, n), block1(1);
   transpose_blocks<<<grid1, block1>>>(n, dA, dAt);   // warm-up
   CUDA_CHECK_KERNEL();
   t0 = now();
@@ -256,7 +293,7 @@ int main(void)
 
   // ---- 2. Warps horizontal on A -------------------------------------------
   // TODO: grid and block of kernel 2 (as given: 1 block of 1 thread)
-  dim3 grid2(1), block2(1);
+  dim3 grid2 = grid0, block2 = block0;
   transpose_horizontal<<<grid2, block2>>>(n, dA, dAt);   // warm-up
   CUDA_CHECK_KERNEL();
   t0 = now();
@@ -266,7 +303,7 @@ int main(void)
 
   // ---- 3. Warps vertical on A ---------------------------------------------
   // TODO: grid and block of kernel 3 (as given: 1 block of 1 thread)
-  dim3 grid3(1), block3(1);
+  dim3 grid3 = grid0, block3 = block0;
   transpose_vertical<<<grid3, block3>>>(n, dA, dAt);   // warm-up
   CUDA_CHECK_KERNEL();
   t0 = now();
@@ -276,7 +313,7 @@ int main(void)
 
   // ---- 4. Through a padded shared tile ------------------------------------
   // TODO: grid and block of kernel 4 (as given: 1 block of 1 thread)
-  dim3 grid4(1), block4(1);
+  dim3 grid4 = grid0, block4 = block0;
   transpose_shmem<<<grid4, block4>>>(n, dA, dAt);   // warm-up
   CUDA_CHECK_KERNEL();
   t0 = now();
@@ -288,7 +325,7 @@ int main(void)
   // The kernel transposes the matrix it is given: dAt receives a copy of A
   // before each launch, and is checked afterwards.
   // TODO: grid and block of kernel 5 (as given: 1 block of 1 thread)
-  dim3 grid5(1), block5(1);
+  dim3 grid5 = grid0, block5 = block0;
   CUDA_CHECK(cudaMemcpy(dAt, dA, bytes, cudaMemcpyDeviceToDevice));
   transpose_inplace<<<grid5, block5>>>(n, dAt);   // warm-up
   CUDA_CHECK_KERNEL();

@@ -264,6 +264,7 @@ void cublasMatmul(cublasHandle_t handle, int n, const float *dA, const float *dB
 //  Where does the partial sum of C(i, j) live while the block walks: in
 //  shared memory, or in a register / variable of the thread? (Who else
 //  needs it?)
+//  In a register / variable of the thread (sum). No other thread needs it.
 //
 //  Requirements:
 //    - both tile loads must be COALESCED: a warp (32 consecutive tx) must
@@ -281,6 +282,21 @@ void cublasMatmul(cublasHandle_t handle, int n, const float *dA, const float *dB
 __global__ void matmul_shmem(int n, const float *A, const float *B, float *C)
 {
   // TODO
+  __shared__ float a[BSXY][BSXY + 1];
+  __shared__ float b[BSXY][BSXY + 1];
+  int tx = threadIdx.x, ty = threadIdx.y;
+  int i = blockIdx.x * BSXY + ty;
+  int j = blockIdx.y * BSXY + tx;
+  float sum = 0.0f;
+  for (int k0 = 0; k0 < n; k0 += BSXY) {
+    a[ty][tx] = (i < n && k0 + tx < n) ? A[i * n + k0 + tx] : 0.0f;
+    int bj = blockIdx.y * BSXY + ty;
+    b[tx][ty] = (k0 + tx < n && bj < n) ? B[k0 + tx + bj * n] : 0.0f;
+    __syncthreads();
+    for (int k = 0; k < BSXY; k++) { sum += a[ty][k] * b[k][tx]; }
+    __syncthreads();
+  }
+  if (i < n && j < n) { C[i * n + j] = sum; }
 }
 
 // =============================================================================
@@ -439,7 +455,7 @@ int main(void)
 
   // ---- 6. Shared memory tiles ---------------------------------------------
   // TODO: grid and block of kernel 6 (as given: 1 block of 1 thread)
-  dim3 grid6(1), block6(1);
+  dim3 grid6 = grid4, block6 = block4;
   matmul_shmem<<<grid6, block6>>>(n, dA, dB, dC);   // warm-up
   CUDA_CHECK_KERNEL();
   t0 = now();
