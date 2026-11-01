@@ -46,15 +46,16 @@
 //  Run:    ./saxpy2d
 // =============================================================================
 //
-//Answers for the questions of the TP:
-/*
-2e) Nothing: only the order of the blocks changes, a warp touches the same elements (3 = 5, 4 = 6).
-3d) 9 = 7 and 10 = 8: only the numbering of the tiles changes.
-4d) 7, 9, 11, 13: row-major no, column-major yes. 8, 10, 12, 14: row-major yes, column-major no.
-    Only the mapping of threadIdx.x counts: coalesced iff threadIdx.x follows the contiguous index.
-5b) The elements of a thread are 32 apart, so at each (di, dj) a warp touches 32 consecutive elements, as in 11-14.
-    Contiguous K x K patch: neighbouring threads K = 4 floats apart -> 128 floats, 16 sectors (2 floats used out of 8): not coalesced.
-*/
+// Only block numbering changes: 3 and 5 have the same accesses, as do 4 and 6.
+// The same holds for 7 and 9, and for 8 and 10.
+// 7, 9, 11, 13: row-major no, column-major yes.
+// 8, 10, 12, 14: row-major yes, column-major no.
+// The layout and the direction of consecutive threadIdx.x decide the access.
+// At fixed (di, dj), the interleaved K x K kernels have the same accesses
+// as 11-14: consecutive floats in one layout, stride n in the other.
+// A contiguous K x K patch gives stride K in the favorable layout and
+// stride K * n in the other. For K = 4: 16 sectors or 32 sectors per warp,
+// respectively. Neither access is coalesced.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

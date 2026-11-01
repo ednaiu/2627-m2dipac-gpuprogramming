@@ -1,6 +1,16 @@
 // =============================================================================
 //  TP3 -- Matrix multiplication on the GPU: C = A B
 //
+// GFLOP/s, measured with nvcc124u1.
+// n       blocks   1D row   1D column   2D horiz   2D vert   cuBLAS
+// 128     16.9     33.1     31.1        28.9       28.8      156.2
+// 250     18.1     70.4     74.1        85.9       88.0      914.3
+// 256     17.8     35.1     35.0        30.9       30.8      995.9
+// 512     18.0     38.2     38.1        35.6       35.5      1699.4
+// 1024    10.1     61.0     60.9        60.7       60.6      5779.3
+// 2048    18.0     25.3     24.9        24.8       24.9      7076.5
+// cuBLAS is faster at every tested size.
+//
 //  A, B and C are N x N single-precision matrices, allocated as 1D arrays of
 //  N*N floats (malloc on the CPU, cudaMalloc on the GPU), with these layouts:
 //
@@ -35,7 +45,7 @@
 //  time and the performance in GFLOP/s.
 //
 //  Build:  nvcc -O2 -arch=native matmul.cu -o matmul -lcublas
-//  Run:    ./matmul            (the matrix size n is set in main())
+//  Run:    ./matmul            (the matrix sizes are set in main())
 //  The program calls cuBLAS: it MUST be linked with -lcublas. On godbolt,
 //  the compiler options of the pane that runs it must read -O2 -lcublas;
 //  without -lcublas the program does not link.
@@ -120,8 +130,8 @@ __global__ void matmul_blocks(int n, const float *A, const float *B, float *C)
 //  The access is not coalesced.
 //  B: j changes across the warp and the values are N floats apart. The warp
 //  touches 32 sectors. The access is not coalesced.
-//  C: the warp writes 32 neighboring values in row i and fills 4 sectors.
-//  The write is coalesced.
+//  C: a full warp writes 32 consecutive floats. With aligned rows this
+//  fills 4 sectors; a misaligned row can touch 5. Tail warps write fewer values.
 //  Kernel 1 has one active thread per block. This kernel works with full warps.
 // =============================================================================
 __global__ void matmul_1d_row(int n, const float *A, const float *B, float *C)
@@ -192,8 +202,8 @@ __global__ void matmul_1d_column(int n, const float *A, const float *B, float *C
 //  not a coalesced access.
 //  B: j changes across the warp and the values are N floats apart. The warp
 //  touches 32 sectors. The access is not coalesced.
-//  C: all 32 writes are next to each other in row i and fill 4 sectors. The
-//  write is coalesced. This is the same pattern as kernel 2.
+//  C: a full warp writes 32 consecutive floats: 4 sectors when aligned,
+//  possibly 5 otherwise. This is the same pattern as kernel 2.
 // =============================================================================
 __global__ void matmul_2d_horizontal(int n, const float *A, const float *B, float *C)
 {
@@ -359,95 +369,98 @@ void check(const char *name, int n, double ms, const float *A, const float *B, f
 // =============================================================================
 int main(void)
 {
-  const int n = 1024;   // the matrix size: change it here and rerun
-  size_t bytes = (size_t)n * n * sizeof(float);
-  float *A = (float *)malloc(bytes), *B = (float *)malloc(bytes), *C = (float *)malloc(bytes);
-  initialise(n, A, B);
-  float *dA, *dB, *dC;
-  CUDA_CHECK(cudaMalloc(&dA, bytes));
-  CUDA_CHECK(cudaMalloc(&dB, bytes));
-  CUDA_CHECK(cudaMalloc(&dC, bytes));
-  CUDA_CHECK(cudaMemcpy(dA, A, bytes, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dB, B, bytes, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemset(dC, 0, bytes));
-  printf("%-30s %6s  %-7s %13s %18s\n", "kernel", "N", "result", "time", "performance");
-  double t0;
-  // Every kernel is launched twice. The first launch loads the kernel onto
-  // the GPU (and, for the first kernel, finishes setting the device up) and
-  // is not timed; the clock is read around the second one.
+  const int sizes[] = {128, 250, 256, 512, 1024, 2048};
+  for (int n : sizes) {
+    size_t bytes = (size_t)n * n * sizeof(float);
+    float *A = (float *)malloc(bytes), *B = (float *)malloc(bytes), *C = (float *)malloc(bytes);
+    initialise(n, A, B);
+    float *dA, *dB, *dC;
+    CUDA_CHECK(cudaMalloc(&dA, bytes));
+    CUDA_CHECK(cudaMalloc(&dB, bytes));
+    CUDA_CHECK(cudaMalloc(&dC, bytes));
+    CUDA_CHECK(cudaMemcpy(dA, A, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB, B, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(dC, 0, bytes));
+    printf("%-30s %6s  %-7s %13s %18s\n", "kernel", "N", "result", "time", "performance");
+    double t0;
+    // Every kernel is launched twice. The first launch loads the kernel onto
+    // the GPU (and, for the first kernel, finishes setting the device up) and
+    // is not timed; the clock is read around the second one.
 
-  // ---- 1. One thread per element, blocks of one thread --------------------
-  // TODO: grid and block of kernel 1 (as given: 1 block of 1 thread)
-  dim3 grid1(1), block1(1);
-  matmul_blocks<<<grid1, block1>>>(n, dA, dB, dC);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  matmul_blocks<<<grid1, block1>>>(n, dA, dB, dC);   // timed
-  CUDA_CHECK_KERNEL();
-  check("1 one thread per block", n, now() - t0, A, B, C, dC);
+    // ---- 1. One thread per element, blocks of one thread --------------------
+    // TODO: grid and block of kernel 1 (as given: 1 block of 1 thread)
+    dim3 grid1(n, n), block1(1);
+    matmul_blocks<<<grid1, block1>>>(n, dA, dB, dC);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    matmul_blocks<<<grid1, block1>>>(n, dA, dB, dC);   // timed
+    CUDA_CHECK_KERNEL();
+    check("1 one thread per block", n, now() - t0, A, B, C, dC);
 
-  // ---- 2. 1D blocks along a row of C --------------------------------------
-  // TODO: grid and block of kernel 2 (as given: 1 block of 1 thread)
-  dim3 grid2(1), block2(1);
-  grid2 = dim3(n, (n + BS_1D - 1) / BS_1D);
-  block2 = dim3(BS_1D);
-  matmul_1d_row<<<grid2, block2>>>(n, dA, dB, dC);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  matmul_1d_row<<<grid2, block2>>>(n, dA, dB, dC);   // timed
-  CUDA_CHECK_KERNEL();
-  check("2 1D blocks, row of C", n, now() - t0, A, B, C, dC);
+    // ---- 2. 1D blocks along a row of C --------------------------------------
+    // TODO: grid and block of kernel 2 (as given: 1 block of 1 thread)
+    dim3 grid2(1), block2(1);
+    grid2 = dim3(n, (n + BS_1D - 1) / BS_1D);
+    block2 = dim3(BS_1D);
+    matmul_1d_row<<<grid2, block2>>>(n, dA, dB, dC);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    matmul_1d_row<<<grid2, block2>>>(n, dA, dB, dC);   // timed
+    CUDA_CHECK_KERNEL();
+    check("2 1D blocks, row of C", n, now() - t0, A, B, C, dC);
 
-  // ---- 3. 1D blocks along a column of C -----------------------------------
-  // TODO: grid and block of kernel 3 (as given: 1 block of 1 thread)
-  dim3 grid3(1), block3(1);
-  grid3 = dim3(n, (n + BS_1D - 1) / BS_1D);
-  block3 = dim3(BS_1D);
-  matmul_1d_column<<<grid3, block3>>>(n, dA, dB, dC);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  matmul_1d_column<<<grid3, block3>>>(n, dA, dB, dC);   // timed
-  CUDA_CHECK_KERNEL();
-  check("3 1D blocks, column of C", n, now() - t0, A, B, C, dC);
+    // ---- 3. 1D blocks along a column of C -----------------------------------
+    // TODO: grid and block of kernel 3 (as given: 1 block of 1 thread)
+    dim3 grid3(1), block3(1);
+    grid3 = dim3(n, (n + BS_1D - 1) / BS_1D);
+    block3 = dim3(BS_1D);
+    matmul_1d_column<<<grid3, block3>>>(n, dA, dB, dC);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    matmul_1d_column<<<grid3, block3>>>(n, dA, dB, dC);   // timed
+    CUDA_CHECK_KERNEL();
+    check("3 1D blocks, column of C", n, now() - t0, A, B, C, dC);
 
-  // ---- 4. 2D blocks, warps horizontal -------------------------------------
-  // TODO: grid and block of kernel 4 (as given: 1 block of 1 thread)
-  dim3 grid4(1), block4(1);
-  block4 = dim3(BS_2D, BS_2D);
-  grid4 = dim3((n + block4.x - 1) / block4.x,
-               (n + block4.y - 1) / block4.y);
-  matmul_2d_horizontal<<<grid4, block4>>>(n, dA, dB, dC);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  matmul_2d_horizontal<<<grid4, block4>>>(n, dA, dB, dC);   // timed
-  CUDA_CHECK_KERNEL();
-  check("4 2D blocks, warps horizontal", n, now() - t0, A, B, C, dC);
+    // ---- 4. 2D blocks, warps horizontal -------------------------------------
+    // TODO: grid and block of kernel 4 (as given: 1 block of 1 thread)
+    dim3 grid4(1), block4(1);
+    block4 = dim3(BS_2D, BS_2D);
+    grid4 = dim3((n + block4.x - 1) / block4.x,
+                 (n + block4.y - 1) / block4.y);
+    matmul_2d_horizontal<<<grid4, block4>>>(n, dA, dB, dC);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    matmul_2d_horizontal<<<grid4, block4>>>(n, dA, dB, dC);   // timed
+    CUDA_CHECK_KERNEL();
+    check("4 2D blocks, warps horizontal", n, now() - t0, A, B, C, dC);
 
-  // ---- 5. 2D blocks, warps vertical ---------------------------------------
-  // TODO: grid and block of kernel 5 (as given: 1 block of 1 thread)
-  dim3 grid5(1), block5(1);
-  block5 = dim3(BS_2D, BS_2D);
-  grid5 = dim3((n + block5.x - 1) / block5.x,
-               (n + block5.y - 1) / block5.y);
-  matmul_2d_vertical<<<grid5, block5>>>(n, dA, dB, dC);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  matmul_2d_vertical<<<grid5, block5>>>(n, dA, dB, dC);   // timed
-  CUDA_CHECK_KERNEL();
-  check("5 2D blocks, warps vertical", n, now() - t0, A, B, C, dC);
+    // ---- 5. 2D blocks, warps vertical ---------------------------------------
+    // TODO: grid and block of kernel 5 (as given: 1 block of 1 thread)
+    dim3 grid5(1), block5(1);
+    block5 = dim3(BS_2D, BS_2D);
+    grid5 = dim3((n + block5.x - 1) / block5.x,
+                 (n + block5.y - 1) / block5.y);
+    matmul_2d_vertical<<<grid5, block5>>>(n, dA, dB, dC);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    matmul_2d_vertical<<<grid5, block5>>>(n, dA, dB, dC);   // timed
+    CUDA_CHECK_KERNEL();
+    check("5 2D blocks, warps vertical", n, now() - t0, A, B, C, dC);
 
-  // ---- 6. cuBLAS ----------------------------------------------------------
-  cublasHandle_t handle;
-  CUBLAS_CHECK(cublasCreate(&handle));
-  cublasMatmul(handle, n, dA, dB, dC);     // warm-up: cuBLAS sets itself up on its first call
-  CUDA_CHECK(cudaDeviceSynchronize());
-  t0 = now();
-  cublasMatmul(handle, n, dA, dB, dC);
-  CUDA_CHECK(cudaDeviceSynchronize());
-  check("6 cuBLAS", n, now() - t0, A, B, C, dC);
-  CUBLAS_CHECK(cublasDestroy(handle));
+    // ---- 6. cuBLAS ----------------------------------------------------------
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+    cublasMatmul(handle, n, dA, dB, dC);     // warm-up: cuBLAS sets itself up on its first call
+    CUDA_CHECK(cudaDeviceSynchronize());
+    t0 = now();
+    cublasMatmul(handle, n, dA, dB, dC);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    check("6 cuBLAS", n, now() - t0, A, B, C, dC);
+    CUBLAS_CHECK(cublasDestroy(handle));
 
-  CUDA_CHECK(cudaFree(dA)); CUDA_CHECK(cudaFree(dB)); CUDA_CHECK(cudaFree(dC));
-  free(A); free(B); free(C);
+    CUDA_CHECK(cudaFree(dA)); CUDA_CHECK(cudaFree(dB)); CUDA_CHECK(cudaFree(dC));
+    free(A); free(B); free(C);
+    printf("\n");
+  }
   return 0;
 }

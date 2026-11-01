@@ -11,15 +11,18 @@ __global__ void cudaHello(){
 
 int main() {
   int numBlocks = 1;
-  int blockSize = 32;
+  int blockSize;
 
   // Experiment with different blockSize values (threads per block) over the powers of 2,
   // keeping the total number of threads equal to 64
   // A FAIRE ...
-  cudaHello<<<numBlocks, blockSize>>>(); 
+  for (numBlocks = 1; numBlocks <= 64; numBlocks *= 2) {
+    blockSize = 64 / numBlocks;
+    cudaHello<<<numBlocks, blockSize>>>();
 
-  cudaError_t cudaerr = cudaDeviceSynchronize();
-  if (cudaerr != cudaSuccess)
-    printf("kernel launch failed with error \"%s\".\n", cudaGetErrorString(cudaerr));
-  return 0;
+    cudaError_t cudaerr = cudaDeviceSynchronize();
+    if (cudaerr != cudaSuccess)
+      printf("kernel launch failed with error \"%s\".\n", cudaGetErrorString(cudaerr));
   }
+  return 0;
+}

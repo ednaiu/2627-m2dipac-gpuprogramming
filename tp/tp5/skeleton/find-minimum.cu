@@ -1,6 +1,18 @@
 // =============================================================================
 //  TP5 -- The minimum of an array on the GPU: a reduction
 //
+// version                  result                        time     bandwidth
+// 1 interleaved            ok    (min =  -1.0)     0.808 ms     79.2 GB/s
+// 2 contiguous             ok    (min =  -1.0)     0.765 ms     83.7 GB/s
+// 3 several per thread     ok    (min =  -1.0)     0.270 ms    237.0 GB/s
+// 4 last warp              ok    (min =  -1.0)     0.267 ms    239.6 GB/s
+// 5 two launches           ok    (min =  -1.0)     0.271 ms    236.0 GB/s
+// read only (given)        ok    (min =  -1.0)     0.262 ms    244.1 GB/s
+// Contiguous threads give a small gain over interleaved threads.
+// Several elements per thread give the main gain: fewer trees and partials.
+// The last warp alone saves block barriers and is closest to read only.
+// The second launch copies only one float, but adds a little time.
+//
 //  a is an array of n floats (malloc on the CPU, cudaMalloc on the GPU),
 //  filled with values between 0 and 999, with ONE element set to -1 at a
 //  random position: the minimum is -1, and a kernel that skips a part of the
@@ -94,10 +106,23 @@ __global__ void read_only(int n, const float *a, float *partial)
 //  Grid: ceil(n / BS) blocks of BS threads; the CPU takes the minimum of the
 //  ceil(n / BS) partials (done by main()).
 //  How many warps execute each step?
+// W = warpSize. Active warps: min(BS / W, BS / (2 * stride)).
 // =============================================================================
 __global__ void min_interleaved(int n, const float *a, float *partial)
 {
   // TODO
+  __shared__ float s[BS];
+  int t = threadIdx.x;
+  int i = blockIdx.x * BS + t;
+  s[t] = (i < n) ? a[i] : FLT_MAX;
+  __syncthreads();
+  for (int stride = 1; stride < BS; stride *= 2) {
+    if (t % (2 * stride) == 0) {
+      s[t] = fminf(s[t], s[t + stride]);
+    }
+    __syncthreads();
+  }
+  if (t == 0) { partial[blockIdx.x] = s[0]; }
 }
 
 // =============================================================================
@@ -107,10 +132,24 @@ __global__ void min_interleaved(int n, const float *a, float *partial)
 //  t < stride replace s[t] by fminf(s[t], s[t + stride]), a barrier after
 //  every step. Which warps execute each step now?
 //  Grid: ceil(n / BS) blocks of BS threads; the CPU finishes.
+// Active warps: ceil(stride / W). Only warp 0 when stride <= W.
+// min(stride, W) banks per busy warp, no bank conflict.
 // =============================================================================
 __global__ void min_contiguous(int n, const float *a, float *partial)
 {
   // TODO
+  __shared__ float s[BS];
+  int t = threadIdx.x;
+  int i = blockIdx.x * BS + t;
+  s[t] = (i < n) ? a[i] : FLT_MAX;
+  __syncthreads();
+  for (int stride = BS / 2; stride > 0; stride /= 2) {
+    if (t < stride) {
+      s[t] = fminf(s[t], s[t + stride]);
+    }
+    __syncthreads();
+  }
+  if (t == 0) { partial[blockIdx.x] = s[0]; }
 }
 
 // =============================================================================
@@ -123,10 +162,29 @@ __global__ void min_contiguous(int n, const float *a, float *partial)
 //  tree of version 2 on the BS values: one tree per block instead of one per
 //  BS elements, and only G partials for the CPU.
 //  Grid: G blocks of BS threads.
+// Elements per thread: floor(n / (G * BS)), plus one for the first
+// n % (G * BS) threads. Version 2 reads at most one per thread.
+// Both use 1 + log2(BS) barriers per block.
+// G blocks here, ceil(n / BS) in version 2.
 // =============================================================================
 __global__ void min_multi(int n, const float *a, float *partial)
 {
   // TODO
+  __shared__ float s[BS];
+  int t = threadIdx.x;
+  float x = FLT_MAX;
+  for (int i = blockIdx.x * BS + t; i < n; i += gridDim.x * BS) {
+    x = fminf(x, a[i]);
+  }
+  s[t] = x;
+  __syncthreads();
+  for (int stride = BS / 2; stride > 0; stride /= 2) {
+    if (t < stride) {
+      s[t] = fminf(s[t], s[t + stride]);
+    }
+    __syncthreads();
+  }
+  if (t == 0) { partial[blockIdx.x] = s[0]; }
 }
 
 // =============================================================================
@@ -139,10 +197,34 @@ __global__ void min_multi(int n, const float *a, float *partial)
 //  the threads of a warp may run ahead of each other: the warp barrier is
 //  required). Thread 0 writes fminf(s[0], s[1]) to partial[b].
 //  Grid: G blocks of BS threads.
+// log2(BS / W) block barriers, including the one after the load.
 // =============================================================================
 __global__ void min_lastwarp(int n, const float *a, float *partial)
 {
   // TODO
+  __shared__ float s[BS];
+  int t = threadIdx.x;
+  float x = FLT_MAX;
+  for (int i = blockIdx.x * BS + t; i < n; i += gridDim.x * BS) {
+    x = fminf(x, a[i]);
+  }
+  s[t] = x;
+  __syncthreads();
+  for (int stride = BS / 2; stride > 32; stride /= 2) {
+    if (t < stride) {
+      s[t] = fminf(s[t], s[t + stride]);
+    }
+    __syncthreads();
+  }
+  if (t < 32) {
+    for (int stride = 32; stride > 1; stride /= 2) {
+      if (t < stride) {
+        s[t] = fminf(s[t], s[t + stride]);
+      }
+      __syncwarp();
+    }
+    if (t == 0) { partial[blockIdx.x] = fminf(s[0], s[1]); }
+  }
 }
 
 // =============================================================================
@@ -153,6 +235,8 @@ __global__ void min_lastwarp(int n, const float *a, float *partial)
 //  threads, which writes the minimum of the G partials to result[0]. The
 //  kernel works on any array of any length, so on the partials too. The CPU
 //  copies one float. See main().
+// With two blocks: two partials and a write past result[0].
+// With W threads: s[W..BS-1] is uninitialised and some inputs are skipped.
 // =============================================================================
 
 // ----------------------------------------------------------------------------
@@ -229,7 +313,7 @@ int main(void)
 
   // ---- 1. interleaved tree -------------------------------------------------
   // TODO: grid and block of version 1 (as given: 1 block of 1 thread)
-  dim3 grid1(1), block1(1);
+  dim3 grid1(blocks1), block1(BS);
   min_interleaved<<<grid1, block1>>>(n, da, dPartial);   // warm-up
   CUDA_CHECK_KERNEL();
   t0 = now();
@@ -241,7 +325,7 @@ int main(void)
 
   // ---- 2. contiguous tree --------------------------------------------------
   // TODO: grid and block of version 2 (as given: 1 block of 1 thread)
-  dim3 grid2(1), block2(1);
+  dim3 grid2(blocks1), block2(BS);
   min_contiguous<<<grid2, block2>>>(n, da, dPartial);   // warm-up
   CUDA_CHECK_KERNEL();
   t0 = now();
@@ -253,7 +337,7 @@ int main(void)
 
   // ---- 3. several elements per thread --------------------------------------
   // TODO: grid and block of version 3 (as given: 1 block of 1 thread)
-  dim3 grid3(1), block3(1);
+  dim3 grid3(G), block3(BS);
   min_multi<<<grid3, block3>>>(n, da, dPartial);   // warm-up
   CUDA_CHECK_KERNEL();
   t0 = now();
@@ -265,7 +349,7 @@ int main(void)
 
   // ---- 4. the last warp alone ----------------------------------------------
   // TODO: grid and block of version 4 (as given: 1 block of 1 thread)
-  dim3 grid4(1), block4(1);
+  dim3 grid4(G), block4(BS);
   min_lastwarp<<<grid4, block4>>>(n, da, dPartial);   // warm-up
   CUDA_CHECK_KERNEL();
   t0 = now();
@@ -277,7 +361,7 @@ int main(void)
 
   // ---- 5. two launches: the partials reduced by the GPU --------------------
   // TODO: grid and block of the second launch, on the G partials (as given: 1 block of 1 thread)
-  dim3 grid5(1), block5(1);
+  dim3 grid5(1), block5(BS);
   t0 = now();
   min_lastwarp<<<grid4, block4>>>(n, da, dPartial);      // G partials
   CUDA_CHECK_KERNEL();

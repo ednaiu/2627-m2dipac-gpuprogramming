@@ -113,6 +113,14 @@ void cpu_dgemm(int m, int n, int k, const double *A, int lda,
 __global__ void matvec(int n, const float *A, const float *b, float *c)
 {
   // TODO
+  int i = blockIdx.x * BS + threadIdx.x;
+  if (i < n) {
+    float sum = 0.0f;
+    for (int k = 0; k < n; k++) {
+      sum += A[i + k * n] * b[k];
+    }
+    c[i] = sum;
+  }
 }
 
 // =============================================================================
@@ -126,6 +134,13 @@ __global__ void matvec(int n, const float *A, const float *b, float *c)
 void version1(int n, const float *dA, const float *B, float *C, float *dB, float *dC)
 {
   // TODO: for each column j, cudaMemcpy in, matvec, cudaMemcpy out
+  size_t bytes = (size_t)n * sizeof(float);
+  for (int j = 0; j < n; j++) {
+    CUDA_CHECK(cudaMemcpy(dB, B + j * n, bytes, cudaMemcpyHostToDevice));
+    matvec<<<(n + BS - 1) / BS, BS>>>(n, dA, dB, dC);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(C + j * n, dC, bytes, cudaMemcpyDeviceToHost));
+  }
 }
 
 // =============================================================================
@@ -138,11 +153,38 @@ void version1(int n, const float *dA, const float *B, float *C, float *dB, float
 //  what runs at the same time is the work of different streams. After the
 //  loop, wait for every stream (cudaDeviceSynchronize). Create the S streams
 //  at the start (cudaStreamCreate) and destroy them at the end.
+// Server run, PINNED = 1: best S = 16, 35.317 ms.
+// Speedup = 237.993 / 35.317 = 6.74.
+// S = 1, 2, 4, 8, 16: 235.471, 117.323, 61.140, 42.880, 35.317 ms.
+// Each matvec has ceil(n / BS) blocks, so it uses at most that many SMs.
+// If the GPU has more SMs, concurrent matvecs can use the others.
+// More streams also overlap copies with kernels; the gain slows as
+// GPU resources fill up.
+// S = 1 has no overlap: 235.471 ms, close to sequential at 237.993 ms.
+// The next use of a slot waits for its copy out in the same stream.
+// With pageable memory, cudaMemcpyAsync may block the host and use
+// a pinned staging buffer, reducing overlap.
+// Server run, PINNED = 0: sequential = 233.941 ms.
+// S = 1, 2, 4, 8, 16: 232.260, 234.236, 235.537, 234.062, 234.844 ms.
+// All stay close to sequential: streams give no noticeable speedup.
 // =============================================================================
 void version2(int n, int S, const float *dA, const float *B, float *C, float *dB, float *dC)
 {
   // TODO: S streams, S slots; column j in stream j % S, cudaMemcpyAsync
   // in, matvec in the stream, cudaMemcpyAsync out; wait at the end
+  cudaStream_t streams[MAXS];
+  for (int s = 0; s < S; s++) { CUDA_CHECK(cudaStreamCreate(&streams[s])); }
+  size_t bytes = (size_t)n * sizeof(float);
+  for (int j = 0; j < n; j++) {
+    int s = j % S;
+    float *dBs = dB + s * n, *dCs = dC + s * n;
+    CUDA_CHECK(cudaMemcpyAsync(dBs, B + j * n, bytes, cudaMemcpyHostToDevice, streams[s]));
+    matvec<<<(n + BS - 1) / BS, BS, 0, streams[s]>>>(n, dA, dBs, dCs);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpyAsync(C + j * n, dCs, bytes, cudaMemcpyDeviceToHost, streams[s]));
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+  for (int s = 0; s < S; s++) { CUDA_CHECK(cudaStreamDestroy(streams[s])); }
 }
 
 // #############################################################################
@@ -162,12 +204,38 @@ void version2(int n, int S, const float *dA, const float *B, float *C, float *dB
 //  cuBLAS queues its kernels in the stream set by cublasSetStream(handle,
 //  stream): set it before each call. n / M panels, panel p in stream p % S.
 //  After the loop, wait for every stream, then destroy them.
+// Server run, PINNED = 1: best M = 32, 21.243 ms.
+// Speedup over reference = 28.038 / 21.243 = 1.32.
+// M = 8, 32, 128, 512: 22.422, 21.243, 21.418, 25.250 ms.
+// Small M gives many small copies and gemm calls, with less reuse of A.
+// Here M = 8 is only slightly slower than M = 32.
+// Large M gives fewer panels and longer first copy in and last copy out.
+// There is no computation to hide these two copies.
+// Server run, PINNED = 0: M = 8, 32, 128, 512 gives
+// 54.111, 30.571, 27.585, 29.380 ms. Best M = 128.
+// Speedup over reference = 28.830 / 27.585 = 1.05.
 // =============================================================================
 void version3(int n, int S, int M, cublasHandle_t handle, const double *dA,
               const double *B, double *C, double *dB, double *dC)
 {
   // TODO: panels of M columns, cublasSetStream + cublasDgemm on each
   // panel in stream p % S
+  cudaStream_t streams[MAXS];
+  for (int s = 0; s < S; s++) { CUDA_CHECK(cudaStreamCreate(&streams[s])); }
+  const double one = 1.0, zero = 0.0;
+  size_t count = (size_t)M * n, bytes = count * sizeof(double);
+  for (int p = 0; p < n / M; p++) {
+    int s = p % S;
+    double *dBs = dB + s * count, *dCs = dC + s * count;
+    CUDA_CHECK(cudaMemcpyAsync(dBs, B + p * count, bytes, cudaMemcpyHostToDevice, streams[s]));
+    CUBLAS_CHECK(cublasSetStream(handle, streams[s]));
+    CUBLAS_CHECK(cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, M, n,
+                           &one, dA, n, dBs, n, &zero, dCs, n));
+    CUDA_CHECK(cudaMemcpyAsync(C + p * count, dCs, bytes, cudaMemcpyDeviceToHost, streams[s]));
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+  CUBLAS_CHECK(cublasSetStream(handle, 0));
+  for (int s = 0; s < S; s++) { CUDA_CHECK(cudaStreamDestroy(streams[s])); }
 }
 
 // =============================================================================
@@ -180,12 +248,46 @@ void version3(int n, int S, int M, cublasHandle_t handle, const double *dA,
 //  Issue all the GPU work first, then call cpu_dgemm, then wait for the
 //  streams: the copy engines, the GPU and the CPU then all work at the same
 //  time.
+// Server run, PINNED = 1, 24 CPU threads: best npcpu = 4, 15.104 ms.
+// Speedup over version 3 at M = 128: 21.418 / 15.104 = 1.42.
+// Compared with its best M = 32: 21.243 / 15.104 = 1.41.
+// npcpu = 0, 1, 2, 3, 4: 21.420, 19.678, 17.989, 16.196, 15.104 ms.
+// Too many CPU panels can make the CPU the slower part.
+// Server run, PINNED = 0: npcpu = 0, 1, 2, 3, 4 gives
+// 27.785, 28.624, 29.029, 30.478, 32.439 ms. Best npcpu = 0.
+// Pageable copies may block while GPU work is being queued,
+// leaving less GPU work to overlap with cpu_dgemm.
+// Queue GPU work before cpu_dgemm so both run at the same time.
+// Otherwise the GPU starts only after the CPU has finished.
+// Let g be the GPU speedup from double to single precision.
+// The CPU/GPU speed ratio is multiplied by 2 / g.
+// The CPU would take a much smaller share and save little time.
 // =============================================================================
 void version4(int n, int S, int M, int npcpu, cublasHandle_t handle, const double *A,
               const double *dA, const double *B, double *C, double *dB, double *dC)
 {
   // TODO: the first n / M - npcpu panels on the GPU as in version 3 (issued
   // first), cpu_dgemm on the last npcpu panels, then wait for the streams
+  cudaStream_t streams[MAXS];
+  for (int s = 0; s < S; s++) { CUDA_CHECK(cudaStreamCreate(&streams[s])); }
+  const double one = 1.0, zero = 0.0;
+  size_t count = (size_t)M * n, bytes = count * sizeof(double);
+  int ngpu = n / M - npcpu;
+  for (int p = 0; p < ngpu; p++) {
+    int s = p % S;
+    double *dBs = dB + s * count, *dCs = dC + s * count;
+    CUDA_CHECK(cudaMemcpyAsync(dBs, B + p * count, bytes, cudaMemcpyHostToDevice, streams[s]));
+    CUBLAS_CHECK(cublasSetStream(handle, streams[s]));
+    CUBLAS_CHECK(cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, M, n,
+                           &one, dA, n, dBs, n, &zero, dCs, n));
+    CUDA_CHECK(cudaMemcpyAsync(C + p * count, dCs, bytes, cudaMemcpyDeviceToHost, streams[s]));
+  }
+  if (npcpu > 0) {
+    cpu_dgemm(n, npcpu * M, n, A, n, B + ngpu * count, n, C + ngpu * count, n);
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+  CUBLAS_CHECK(cublasSetStream(handle, 0));
+  for (int s = 0; s < S; s++) { CUDA_CHECK(cudaStreamDestroy(streams[s])); }
 }
 
 // #############################################################################

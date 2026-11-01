@@ -1,6 +1,16 @@
 // =============================================================================
 //  TP4 -- Matrix multiplication on the GPU, through shared memory
 //
+// GFLOP/s, measured with nvcc124u1.
+// n       horizontal   shared   cuBLAS
+// 250     61.8         256.0    621.4
+// 256     21.2         275.4    759.3
+// 512     24.4         289.3    1696.8
+// 1024    61.2         751.2    5443.1
+// 2048    25.0         314.2    7063.7
+// Shared tiles are faster than the horizontal kernel at every tested size.
+// cuBLAS is faster than both. The cloud run exceeded its time limit at 4096.
+//
 //  A, B and C are N x N single-precision matrices, allocated as 1D arrays of
 //  N*N floats (malloc on the CPU, cudaMalloc on the GPU), with these layouts:
 //
@@ -41,7 +51,7 @@
 //  time and the performance in GFLOP/s.
 //
 //  Build:  nvcc -O2 -arch=native matmul-shmem.cu -o matmul-shmem -lcublas
-//  Run:    ./matmul-shmem      (the matrix size n is set in main())
+//  Run:    ./matmul-shmem      (the matrix sizes are set in main())
 //  The program calls cuBLAS: it MUST be linked with -lcublas. On godbolt,
 //  the compiler options of the pane that runs it must read -O2 -lcublas;
 //  without -lcublas the program does not link.
@@ -269,6 +279,11 @@ void cublasMatmul(cublasHandle_t handle, int n, const float *dA, const float *dB
 //  shared memory, or in a register / variable of the thread? (Who else
 //  needs it?)
 //  In a register / variable of the thread (sum). No other thread needs it.
+// tx runs along a row of A and a column of B: both loads are contiguous.
+// a[ty][tx] is a row write; b[tx][ty] is a column write.
+// Padding spreads the column write over different banks.
+// In the product, a[ty][k] is broadcast and b[k][tx] is a row read.
+// Out-of-bounds loads put zero in the tiles. All threads reach both barriers.
 //
 //  Requirements:
 //    - both tile loads must be COALESCED: a warp (32 consecutive tx) must
@@ -384,90 +399,93 @@ void check(const char *name, int n, double ms, const float *A, const float *B, f
 // =============================================================================
 int main(void)
 {
-  const int n = 250;   // the matrix size: change it here and rerun
-  size_t bytes = (size_t)n * n * sizeof(float);
-  float *A = (float *)malloc(bytes), *B = (float *)malloc(bytes), *C = (float *)malloc(bytes);
-  initialise(n, A, B);
-  float *dA, *dB, *dC;
-  CUDA_CHECK(cudaMalloc(&dA, bytes));
-  CUDA_CHECK(cudaMalloc(&dB, bytes));
-  CUDA_CHECK(cudaMalloc(&dC, bytes));
-  CUDA_CHECK(cudaMemcpy(dA, A, bytes, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(dB, B, bytes, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemset(dC, 0, bytes));
-  printf("%-30s %6s  %-7s %13s %18s\n", "kernel", "N", "result", "time", "performance");
-  double t0;
-  // Every kernel is launched twice. The first launch loads the kernel onto
-  // the GPU (and, for the first kernel, finishes setting the device up) and
-  // is not timed; the clock is read around the second one.
+  const int sizes[] = {250, 256, 512, 1024, 2048};
+  for (int n : sizes) {
+    size_t bytes = (size_t)n * n * sizeof(float);
+    float *A = (float *)malloc(bytes), *B = (float *)malloc(bytes), *C = (float *)malloc(bytes);
+    initialise(n, A, B);
+    float *dA, *dB, *dC;
+    CUDA_CHECK(cudaMalloc(&dA, bytes));
+    CUDA_CHECK(cudaMalloc(&dB, bytes));
+    CUDA_CHECK(cudaMalloc(&dC, bytes));
+    CUDA_CHECK(cudaMemcpy(dA, A, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB, B, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(dC, 0, bytes));
+    printf("%-30s %6s  %-7s %13s %18s\n", "kernel", "N", "result", "time", "performance");
+    double t0;
+    // Every kernel is launched twice. The first launch loads the kernel onto
+    // the GPU (and, for the first kernel, finishes setting the device up) and
+    // is not timed; the clock is read around the second one.
 
-  // ---- 1. One thread per element, blocks of one thread --------------------
-  dim3 grid1(n, n), block1(1);
-  matmul_blocks<<<grid1, block1>>>(n, dA, dB, dC);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  matmul_blocks<<<grid1, block1>>>(n, dA, dB, dC);   // timed
-  CUDA_CHECK_KERNEL();
-  check("1 one thread per block", n, now() - t0, A, B, C, dC);
+    // ---- 1. One thread per element, blocks of one thread --------------------
+    dim3 grid1(n, n), block1(1);
+    matmul_blocks<<<grid1, block1>>>(n, dA, dB, dC);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    matmul_blocks<<<grid1, block1>>>(n, dA, dB, dC);   // timed
+    CUDA_CHECK_KERNEL();
+    check("1 one thread per block", n, now() - t0, A, B, C, dC);
 
-  // ---- 2. 1D blocks along a row of C --------------------------------------
-  dim3 grid2(n, (n + BS_1D - 1) / BS_1D), block2(BS_1D);
-  matmul_1d_row<<<grid2, block2>>>(n, dA, dB, dC);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  matmul_1d_row<<<grid2, block2>>>(n, dA, dB, dC);   // timed
-  CUDA_CHECK_KERNEL();
-  check("2 1D blocks, row of C", n, now() - t0, A, B, C, dC);
+    // ---- 2. 1D blocks along a row of C --------------------------------------
+    dim3 grid2(n, (n + BS_1D - 1) / BS_1D), block2(BS_1D);
+    matmul_1d_row<<<grid2, block2>>>(n, dA, dB, dC);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    matmul_1d_row<<<grid2, block2>>>(n, dA, dB, dC);   // timed
+    CUDA_CHECK_KERNEL();
+    check("2 1D blocks, row of C", n, now() - t0, A, B, C, dC);
 
-  // ---- 3. 1D blocks along a column of C -----------------------------------
-  dim3 grid3((n + BS_1D - 1) / BS_1D, n), block3(BS_1D);
-  matmul_1d_column<<<grid3, block3>>>(n, dA, dB, dC);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  matmul_1d_column<<<grid3, block3>>>(n, dA, dB, dC);   // timed
-  CUDA_CHECK_KERNEL();
-  check("3 1D blocks, column of C", n, now() - t0, A, B, C, dC);
+    // ---- 3. 1D blocks along a column of C -----------------------------------
+    dim3 grid3((n + BS_1D - 1) / BS_1D, n), block3(BS_1D);
+    matmul_1d_column<<<grid3, block3>>>(n, dA, dB, dC);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    matmul_1d_column<<<grid3, block3>>>(n, dA, dB, dC);   // timed
+    CUDA_CHECK_KERNEL();
+    check("3 1D blocks, column of C", n, now() - t0, A, B, C, dC);
 
-  // ---- 4. 2D blocks, warps horizontal -------------------------------------
-  dim3 grid4((n + BSXY - 1) / BSXY, (n + BSXY - 1) / BSXY), block4(BSXY, BSXY);
-  matmul_2d_horizontal<<<grid4, block4>>>(n, dA, dB, dC);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  matmul_2d_horizontal<<<grid4, block4>>>(n, dA, dB, dC);   // timed
-  CUDA_CHECK_KERNEL();
-  check("4 2D blocks, warps horizontal", n, now() - t0, A, B, C, dC);
+    // ---- 4. 2D blocks, warps horizontal -------------------------------------
+    dim3 grid4((n + BSXY - 1) / BSXY, (n + BSXY - 1) / BSXY), block4(BSXY, BSXY);
+    matmul_2d_horizontal<<<grid4, block4>>>(n, dA, dB, dC);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    matmul_2d_horizontal<<<grid4, block4>>>(n, dA, dB, dC);   // timed
+    CUDA_CHECK_KERNEL();
+    check("4 2D blocks, warps horizontal", n, now() - t0, A, B, C, dC);
 
-  // ---- 5. 2D blocks, warps vertical ---------------------------------------
-  dim3 grid5((n + BSXY - 1) / BSXY, (n + BSXY - 1) / BSXY), block5(BSXY, BSXY);
-  matmul_2d_vertical<<<grid5, block5>>>(n, dA, dB, dC);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  matmul_2d_vertical<<<grid5, block5>>>(n, dA, dB, dC);   // timed
-  CUDA_CHECK_KERNEL();
-  check("5 2D blocks, warps vertical", n, now() - t0, A, B, C, dC);
+    // ---- 5. 2D blocks, warps vertical ---------------------------------------
+    dim3 grid5((n + BSXY - 1) / BSXY, (n + BSXY - 1) / BSXY), block5(BSXY, BSXY);
+    matmul_2d_vertical<<<grid5, block5>>>(n, dA, dB, dC);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    matmul_2d_vertical<<<grid5, block5>>>(n, dA, dB, dC);   // timed
+    CUDA_CHECK_KERNEL();
+    check("5 2D blocks, warps vertical", n, now() - t0, A, B, C, dC);
 
-  // ---- cuBLAS, the benchmark ----------------------------------------------
-  cublasHandle_t handle;
-  CUBLAS_CHECK(cublasCreate(&handle));
-  cublasMatmul(handle, n, dA, dB, dC);     // warm-up: cuBLAS sets itself up on its first call
-  CUDA_CHECK(cudaDeviceSynchronize());
-  t0 = now();
-  cublasMatmul(handle, n, dA, dB, dC);
-  CUDA_CHECK(cudaDeviceSynchronize());
-  check("cuBLAS (benchmark)", n, now() - t0, A, B, C, dC);
-  CUBLAS_CHECK(cublasDestroy(handle));
+    // ---- cuBLAS, the benchmark ----------------------------------------------
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+    cublasMatmul(handle, n, dA, dB, dC);     // warm-up: cuBLAS sets itself up on its first call
+    CUDA_CHECK(cudaDeviceSynchronize());
+    t0 = now();
+    cublasMatmul(handle, n, dA, dB, dC);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    check("cuBLAS (benchmark)", n, now() - t0, A, B, C, dC);
+    CUBLAS_CHECK(cublasDestroy(handle));
 
-  // ---- 6. Shared memory tiles ---------------------------------------------
-  // TODO: grid and block of kernel 6 (as given: 1 block of 1 thread)
-  dim3 grid6 = grid4, block6 = block4;
-  matmul_shmem<<<grid6, block6>>>(n, dA, dB, dC);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  matmul_shmem<<<grid6, block6>>>(n, dA, dB, dC);   // timed
-  CUDA_CHECK_KERNEL();
-  check("6 shared memory tiles", n, now() - t0, A, B, C, dC);
+    // ---- 6. Shared memory tiles ---------------------------------------------
+    // TODO: grid and block of kernel 6 (as given: 1 block of 1 thread)
+    dim3 grid6 = grid4, block6 = block4;
+    matmul_shmem<<<grid6, block6>>>(n, dA, dB, dC);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    matmul_shmem<<<grid6, block6>>>(n, dA, dB, dC);   // timed
+    CUDA_CHECK_KERNEL();
+    check("6 shared memory tiles", n, now() - t0, A, B, C, dC);
 
-  CUDA_CHECK(cudaFree(dA)); CUDA_CHECK(cudaFree(dB)); CUDA_CHECK(cudaFree(dC));
-  free(A); free(B); free(C);
+    CUDA_CHECK(cudaFree(dA)); CUDA_CHECK(cudaFree(dB)); CUDA_CHECK(cudaFree(dC));
+    free(A); free(B); free(C);
+    printf("\n");
+  }
   return 0;
 }

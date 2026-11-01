@@ -1,6 +1,18 @@
 // =============================================================================
 //  TP4 -- Matrix transposition on the GPU: At = A^T
 //
+// GB/s, measured with nvcc124u1.
+// n       blocks   horizontal   vertical   shared   in place   copy
+// 256     4.4      28.3         33.6       55.1     53.7       47.7
+// 512     4.6      52.4         74.1       148.1    143.2      153.4
+// 1000    4.6      60.5         118.7      154.6    176.2      173.4
+// 1024    4.6      59.7         88.3       165.2    198.6      179.9
+// 2048    4.6      68.7         95.1       192.0    193.8      213.4
+// 4096    4.5      79.9         110.7      199.3    192.0      222.9
+// Shared-memory versions are closest to copy; blocks of one thread are slowest.
+// Some measured rates exceed copy, especially for small matrices.
+// Copy is a reference measurement, not a strict upper bound for every run.
+//
 //  A and At are N x N single-precision matrices, allocated as 1D arrays of
 //  N*N floats (malloc on the CPU, cudaMalloc on the GPU), both row-major:
 //
@@ -36,7 +48,7 @@
 //  kernels with the copy.
 //
 //  Build:  nvcc -O2 -arch=native transpose.cu -o transpose
-//  Run:    ./transpose          (the matrix size n is set in main())
+//  Run:    ./transpose          (the matrix sizes are set in main())
 // =============================================================================
 #include <cstdio>
 #include <cstdlib>
@@ -128,6 +140,8 @@ __global__ void transpose_horizontal(int n, const float *A, float *At)
 //  Which of the two accesses of a warp is coalesced now?
 //  The write to At: consecutive threads write consecutive floats.
 //  The read from A is strided, not coalesced.
+// Without shared memory, making one access contiguous makes the other
+// strided: a row of A becomes a column of At. Both cannot be coalesced.
 // =============================================================================
 __global__ void transpose_vertical(int n, const float *A, float *At)
 {
@@ -153,6 +167,9 @@ __global__ void transpose_vertical(int n, const float *A, float *At)
 //  but PAD it, [BSXY][BSXY + 1], against bank conflicts. Do not forget the
 //  barrier. Grid: ceil(N / BSXY) x ceil(N / BSXY); N is any positive
 //  integer.
+// Thread (tx, ty) stores the value loaded by thread (ty, tx).
+// A warp reads tile[tx][ty]: 32 banks with padding, one bank without it.
+// Without padding this gives a 32-way bank conflict.
 // =============================================================================
 __global__ void transpose_shmem(int n, const float *A, float *At)
 {
@@ -253,90 +270,93 @@ void check(const char *name, int n, double ms, bool transposed, float *R, float 
 // =============================================================================
 int main(void)
 {
-  const int n = 1000;   // the matrix size: change it here and rerun
-  size_t bytes = (size_t)n * n * sizeof(float);
-  // One host array: A is written into it and sent to the GPU, then every
-  // result is copied back into it and checked against the formula of A.
-  float *R = (float *)malloc(bytes);
-  for (int i = 0; i < n; i++) {
-    for (int j = 0; j < n; j++) { R[i * n + j] = aval(n, i, j); }
+  const int sizes[] = {256, 512, 1000, 1024, 2048, 4096};
+  for (int n : sizes) {
+    size_t bytes = (size_t)n * n * sizeof(float);
+    // One host array: A is written into it and sent to the GPU, then every
+    // result is copied back into it and checked against the formula of A.
+    float *R = (float *)malloc(bytes);
+    for (int i = 0; i < n; i++) {
+      for (int j = 0; j < n; j++) { R[i * n + j] = aval(n, i, j); }
+    }
+    float *dA, *dAt;
+    CUDA_CHECK(cudaMalloc(&dA, bytes));
+    CUDA_CHECK(cudaMalloc(&dAt, bytes));
+    CUDA_CHECK(cudaMemcpy(dA, R, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(dAt, 0, bytes));
+    printf("%-30s %6s  %-7s %13s %15s\n", "kernel", "N", "result", "time", "bandwidth");
+    double t0;
+    // Every kernel is launched twice. The first launch loads the kernel onto
+    // the GPU (and, for the first kernel, finishes setting the device up) and
+    // is not timed; the clock is read around the second one.
+
+    // ---- given: copy, the ceiling -------------------------------------------
+    dim3 grid0((n + BSXY - 1) / BSXY, (n + BSXY - 1) / BSXY), block0(BSXY, BSXY);
+    copy_matrix<<<grid0, block0>>>(n, dA, dAt);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    copy_matrix<<<grid0, block0>>>(n, dA, dAt);   // timed
+    CUDA_CHECK_KERNEL();
+    check("copy (given)", n, now() - t0, false, R, dAt);
+
+    // ---- 1. N x N blocks of one thread --------------------------------------
+    // TODO: grid and block of kernel 1 (as given: 1 block of 1 thread)
+    dim3 grid1(n, n), block1(1);
+    transpose_blocks<<<grid1, block1>>>(n, dA, dAt);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    transpose_blocks<<<grid1, block1>>>(n, dA, dAt);   // timed
+    CUDA_CHECK_KERNEL();
+    check("1 blocks of one thread", n, now() - t0, true, R, dAt);
+
+    // ---- 2. Warps horizontal on A -------------------------------------------
+    // TODO: grid and block of kernel 2 (as given: 1 block of 1 thread)
+    dim3 grid2 = grid0, block2 = block0;
+    transpose_horizontal<<<grid2, block2>>>(n, dA, dAt);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    transpose_horizontal<<<grid2, block2>>>(n, dA, dAt);   // timed
+    CUDA_CHECK_KERNEL();
+    check("2 warps horizontal on A", n, now() - t0, true, R, dAt);
+
+    // ---- 3. Warps vertical on A ---------------------------------------------
+    // TODO: grid and block of kernel 3 (as given: 1 block of 1 thread)
+    dim3 grid3 = grid0, block3 = block0;
+    transpose_vertical<<<grid3, block3>>>(n, dA, dAt);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    transpose_vertical<<<grid3, block3>>>(n, dA, dAt);   // timed
+    CUDA_CHECK_KERNEL();
+    check("3 warps vertical on A", n, now() - t0, true, R, dAt);
+
+    // ---- 4. Through a padded shared tile ------------------------------------
+    // TODO: grid and block of kernel 4 (as given: 1 block of 1 thread)
+    dim3 grid4 = grid0, block4 = block0;
+    transpose_shmem<<<grid4, block4>>>(n, dA, dAt);   // warm-up
+    CUDA_CHECK_KERNEL();
+    t0 = now();
+    transpose_shmem<<<grid4, block4>>>(n, dA, dAt);   // timed
+    CUDA_CHECK_KERNEL();
+    check("4 padded shared tile", n, now() - t0, true, R, dAt);
+
+    // ---- 5. In place --------------------------------------------------------
+    // The kernel transposes the matrix it is given: dAt receives a copy of A
+    // before each launch, and is checked afterwards.
+    // TODO: grid and block of kernel 5 (as given: 1 block of 1 thread)
+    dim3 grid5 = grid0, block5 = block0;
+    CUDA_CHECK(cudaMemcpy(dAt, dA, bytes, cudaMemcpyDeviceToDevice));
+    transpose_inplace<<<grid5, block5>>>(n, dAt);   // warm-up
+    CUDA_CHECK_KERNEL();
+    CUDA_CHECK(cudaMemcpy(dAt, dA, bytes, cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaDeviceSynchronize());            // the copy is finished before the clock starts
+    t0 = now();
+    transpose_inplace<<<grid5, block5>>>(n, dAt);   // timed
+    CUDA_CHECK_KERNEL();
+    check("5 in place", n, now() - t0, true, R, dAt);
+
+    CUDA_CHECK(cudaFree(dA)); CUDA_CHECK(cudaFree(dAt));
+    free(R);
+    printf("\n");
   }
-  float *dA, *dAt;
-  CUDA_CHECK(cudaMalloc(&dA, bytes));
-  CUDA_CHECK(cudaMalloc(&dAt, bytes));
-  CUDA_CHECK(cudaMemcpy(dA, R, bytes, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemset(dAt, 0, bytes));
-  printf("%-30s %6s  %-7s %13s %15s\n", "kernel", "N", "result", "time", "bandwidth");
-  double t0;
-  // Every kernel is launched twice. The first launch loads the kernel onto
-  // the GPU (and, for the first kernel, finishes setting the device up) and
-  // is not timed; the clock is read around the second one.
-
-  // ---- given: copy, the ceiling -------------------------------------------
-  dim3 grid0((n + BSXY - 1) / BSXY, (n + BSXY - 1) / BSXY), block0(BSXY, BSXY);
-  copy_matrix<<<grid0, block0>>>(n, dA, dAt);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  copy_matrix<<<grid0, block0>>>(n, dA, dAt);   // timed
-  CUDA_CHECK_KERNEL();
-  check("copy (given)", n, now() - t0, false, R, dAt);
-
-  // ---- 1. N x N blocks of one thread --------------------------------------
-  // TODO: grid and block of kernel 1 (as given: 1 block of 1 thread)
-  dim3 grid1(n, n), block1(1);
-  transpose_blocks<<<grid1, block1>>>(n, dA, dAt);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  transpose_blocks<<<grid1, block1>>>(n, dA, dAt);   // timed
-  CUDA_CHECK_KERNEL();
-  check("1 blocks of one thread", n, now() - t0, true, R, dAt);
-
-  // ---- 2. Warps horizontal on A -------------------------------------------
-  // TODO: grid and block of kernel 2 (as given: 1 block of 1 thread)
-  dim3 grid2 = grid0, block2 = block0;
-  transpose_horizontal<<<grid2, block2>>>(n, dA, dAt);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  transpose_horizontal<<<grid2, block2>>>(n, dA, dAt);   // timed
-  CUDA_CHECK_KERNEL();
-  check("2 warps horizontal on A", n, now() - t0, true, R, dAt);
-
-  // ---- 3. Warps vertical on A ---------------------------------------------
-  // TODO: grid and block of kernel 3 (as given: 1 block of 1 thread)
-  dim3 grid3 = grid0, block3 = block0;
-  transpose_vertical<<<grid3, block3>>>(n, dA, dAt);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  transpose_vertical<<<grid3, block3>>>(n, dA, dAt);   // timed
-  CUDA_CHECK_KERNEL();
-  check("3 warps vertical on A", n, now() - t0, true, R, dAt);
-
-  // ---- 4. Through a padded shared tile ------------------------------------
-  // TODO: grid and block of kernel 4 (as given: 1 block of 1 thread)
-  dim3 grid4 = grid0, block4 = block0;
-  transpose_shmem<<<grid4, block4>>>(n, dA, dAt);   // warm-up
-  CUDA_CHECK_KERNEL();
-  t0 = now();
-  transpose_shmem<<<grid4, block4>>>(n, dA, dAt);   // timed
-  CUDA_CHECK_KERNEL();
-  check("4 padded shared tile", n, now() - t0, true, R, dAt);
-
-  // ---- 5. In place --------------------------------------------------------
-  // The kernel transposes the matrix it is given: dAt receives a copy of A
-  // before each launch, and is checked afterwards.
-  // TODO: grid and block of kernel 5 (as given: 1 block of 1 thread)
-  dim3 grid5 = grid0, block5 = block0;
-  CUDA_CHECK(cudaMemcpy(dAt, dA, bytes, cudaMemcpyDeviceToDevice));
-  transpose_inplace<<<grid5, block5>>>(n, dAt);   // warm-up
-  CUDA_CHECK_KERNEL();
-  CUDA_CHECK(cudaMemcpy(dAt, dA, bytes, cudaMemcpyDeviceToDevice));
-  CUDA_CHECK(cudaDeviceSynchronize());            // the copy is finished before the clock starts
-  t0 = now();
-  transpose_inplace<<<grid5, block5>>>(n, dAt);   // timed
-  CUDA_CHECK_KERNEL();
-  check("5 in place", n, now() - t0, true, R, dAt);
-
-  CUDA_CHECK(cudaFree(dA)); CUDA_CHECK(cudaFree(dAt));
-  free(R);
   return 0;
 }
